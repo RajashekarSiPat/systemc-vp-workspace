@@ -1,0 +1,24 @@
+# Build artifacts — never read or modify
+build/
+*/build/
+**/build/
+**/_deps/
+**/_skbuild/
+**/CMakeFiles/
+**/*.so
+**/*.a
+**/*.o
+**/*.elf
+
+# QBOX source — treat as read-only upstream dependency
+qbox/
+
+# Large generated / binary assets
+qbox/build/
+**/*.pdf
+**/*.png
+**/*.log
+
+# Editor and OS noise
+.DS_Store
+**/.cache/
