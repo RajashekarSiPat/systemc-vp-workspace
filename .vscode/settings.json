@@ -26,6 +26,23 @@
     "editor.tabSize": 4,
     "editor.insertSpaces": true,
     "files.trimTrailingWhitespace": true,
+    "editor.lineNumbers": "relative",
+
+    // ── Vim (vscodevim) ───────────────────────────────────────────────────────
+    "vim.enable": true,
+    "vim.useSystemClipboard": true,
+    "vim.hlsearch": true,
+    "vim.incsearch": true,
+    "vim.useCtrlKeys": true,
+    "vim.leader": "<Space>",
+    "vim.normalModeKeyBindingsNonRecursive": [
+        { "before": ["<leader>", "f"], "commands": ["workbench.action.quickOpen"] },
+        { "before": ["<leader>", "g"], "commands": ["workbench.action.findInFiles"] },
+        { "before": ["<leader>", "b"], "commands": ["workbench.action.showAllEditors"] },
+        { "before": ["g", "d"],        "commands": ["editor.action.revealDefinition"] },
+        { "before": ["g", "r"],        "commands": ["editor.action.goToReferences"] },
+        { "before": ["K"],             "commands": ["editor.action.showHover"] }
+    ],
 
     // ── File associations ─────────────────────────────────────────────────────
     "files.associations": {

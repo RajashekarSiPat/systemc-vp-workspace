@@ -4,6 +4,7 @@
         "ms-vscode.cmake-tools",
         "twxs.cmake",
         "sumneko.lua",
-        "ms-vscode.cpptools-extension-pack"
+        "ms-vscode.cpptools-extension-pack",
+        "vscodevim.vim"
     ]
 }
