@@ -1,0 +1,34 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cmake: configure",
+            "type": "shell",
+            "command": "cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            "group": "build",
+            "presentation": { "reveal": "always", "panel": "shared" }
+        },
+        {
+            "label": "cmake: build",
+            "type": "shell",
+            "command": "cmake --build build -j$(nproc)",
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "run: usart (simple)",
+            "type": "shell",
+            "command": "LD_LIBRARY_PATH=qbox/build/install/lib:qbox/build/install/lib/qbox-2.0:qbox/build/install/lib/libqemu:build ./build/platforms/cortex-a53-virt/cortex-a53-virt-vp --gs_luafile platforms/cortex-a53-virt/conf.lua",
+            "group": "test",
+            "presentation": { "reveal": "always", "panel": "shared" }
+        },
+        {
+            "label": "run: usart2 (full model)",
+            "type": "shell",
+            "command": "LD_LIBRARY_PATH=qbox/build/install/lib:qbox/build/install/lib/qbox-2.0:qbox/build/install/lib/libqemu:build ./build/platforms/cortex-a53-virt/cortex-a53-virt-vp --gs_luafile platforms/cortex-a53-virt/conf_usart2.lua",
+            "group": "test",
+            "presentation": { "reveal": "always", "panel": "shared" }
+        }
+    ]
+}

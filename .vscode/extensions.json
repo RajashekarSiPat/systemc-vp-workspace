@@ -1,0 +1,9 @@
+{
+    "recommendations": [
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "sumneko.lua",
+        "ms-vscode.cpptools-extension-pack"
+    ]
+}

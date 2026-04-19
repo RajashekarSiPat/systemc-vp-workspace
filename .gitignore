@@ -26,7 +26,6 @@ qbox/
 .DS_Store
 *.swp
 *~
-.vscode/
 .idea/
 
 # ── Claude Code session files ─────────────────────────────────────────────────
