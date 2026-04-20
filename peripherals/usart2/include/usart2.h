@@ -98,6 +98,7 @@ public:
         , m_bus_fwd("bus_fwd")
         , m_clk_hz("clk_hz", 100000000ULL,
                    "Peripheral clock frequency in Hz (default 100 MHz)")
+        , m_sig_irq_seq("sig_irq_seq")
         , m_irq_state(false)
         , m_status(0u)
         , m_irq_tbir_prev(false)
@@ -122,10 +123,27 @@ public:
         backend_socket.register_b_transport(this, &Usart2::rx_receive);
         /* do NOT call can_receive_set() here — sockets not yet bound */
 
-        /* irq_method: drives the GIC output when sc_signals update.
-         * NOTE: STATUS bits are NOT set here; they are updated synchronously
-         * in b_transport / rx_receive to avoid delta-cycle timing issues. */
+        /* irq_method: fires when a new IRQ event is detected (m_sig_irq_seq
+         * incremented by update_status_from_core).  Generates the first half
+         * of the GIC LOW→HIGH pulse: drives LOW, then schedules irq_pulse_method
+         * via m_irq_pulse_event to drive HIGH in the next delta cycle.
+         * The counter ensures a genuine signal value-change on every new event,
+         * avoiding the false/true coalescing issue of sc_signal<bool>.        */
         SC_METHOD(irq_method);
+        sensitive << m_sig_irq_seq;
+        dont_initialize();
+
+        /* irq_pulse_method: second half of the GIC pulse — drives HIGH.       */
+        SC_METHOD(irq_pulse_method);
+        sensitive << m_irq_pulse_event;
+        dont_initialize();
+
+        /* irq_deassert_method: fires when the Usart core's IRQ sc_signals
+         * change.  When all four sources are deasserted (pulses expired via
+         * updateIrqPulses inside advance()), drives irq LOW.  This ensures
+         * the GIC never sees irq permanently HIGH, which would cause infinite
+         * re-delivery if the GIC is in level-sensitive mode.                  */
+        SC_METHOD(irq_deassert_method);
         sensitive << m_sig_tbir << m_sig_tir << m_sig_rir << m_sig_eir;
         dont_initialize();
     }
@@ -188,18 +206,40 @@ private:
     /* ── CCI parameters ─────────────────────────────────────────────────── */
     cci::cci_param<uint64_t> m_clk_hz;
 
+    /* ── GIC pulse sequencer ────────────────────────────────────────────── */
+    /* m_sig_irq_seq is written by update_status_from_core() (QEMU thread) each
+     * time a new IRQ event is detected.  It is monotonically increasing so every
+     * write produces a genuine signal value-change, which reliably triggers
+     * irq_method() in the SystemC thread regardless of whether the previous
+     * pulse's deassert and the new pulse's assert coalesced in the async queue.
+     *
+     * Using sc_signal<bool> for GIC edge generation was broken because:
+     *   advance()  writes  m_sig_tbir.write(false)  (deassert old pulse)
+     *   loadTSR()  writes  m_sig_tbir.write(true)   (assert new pulse)
+     * Both happen in the same b_transport call from QEMU's thread.  SystemC's
+     * async_request_update() batches them: last write wins (true), the pending
+     * value equals the current value (true), so NO value-change event fires and
+     * irq_method() never runs.  The sequence-number signal avoids this by always
+     * changing value on a new IRQ event.                                      */
+    sc_core::sc_signal<unsigned int, sc_core::SC_MANY_WRITERS> m_sig_irq_seq;
+
     /* ── GIC IRQ output state ───────────────────────────────────────────── */
     bool m_irq_state;
 
     /* ── STATUS register (sticky; updated directly from IRQ assert times) ─ */
     uint32_t m_status;
 
-    /* Previous IRQ assertion states — used for rising-edge detection.
-     * These track Usart::is_*_asserted(), NOT the sc_signal values. */
+    /* Previous IRQ assertion states — used for rising-edge detection in
+     * update_status_from_core().  Track Usart::is_*_asserted() (timestamp-based),
+     * not sc_signal values. */
     bool m_irq_tbir_prev;
     bool m_irq_tir_prev;
     bool m_irq_rir_prev;
     bool m_irq_eir_prev;
+
+    /* Event for the second half of the GIC LOW→HIGH pulse: irq_method() drives
+     * LOW and notifies this event; irq_pulse_method() drives HIGH next delta. */
+    sc_core::sc_event m_irq_pulse_event;
 
     /* ── update_status_from_core ─────────────────────────────────────────
      * Poll the Usart core's IRQ assert timestamps and set sticky STATUS bits
@@ -215,23 +255,29 @@ private:
         bool rir  = m_usart.is_rir_asserted();
         bool eir  = m_usart.is_eir_asserted();
 
+        bool new_irq = false;
+
         if (tbir && !m_irq_tbir_prev) {
             m_status |= STATUS_TBIR;
+            new_irq = true;
             SCP_INFO(()) << "TBIR fired at " << sc_core::sc_time_stamp()
                          << "  (TX buffer freed into TSR)";
         }
         if (tir && !m_irq_tir_prev) {
             m_status |= STATUS_TIR;
+            new_irq = true;
             SCP_INFO(()) << "TIR  fired at " << sc_core::sc_time_stamp()
                          << "  (TX frame complete)";
         }
         if (rir && !m_irq_rir_prev) {
             m_status |= STATUS_RIR;
+            new_irq = true;
             SCP_INFO(()) << "RIR  fired at " << sc_core::sc_time_stamp()
                          << "  (RX data ready in RBUF)";
         }
         if (eir && !m_irq_eir_prev) {
             m_status |= STATUS_EIR;
+            new_irq = true;
             SCP_INFO(()) << "EIR  fired at " << sc_core::sc_time_stamp()
                          << "  (error: OE/FE/PE)";
         }
@@ -240,6 +286,16 @@ private:
         m_irq_tir_prev  = tir;
         m_irq_rir_prev  = rir;
         m_irq_eir_prev  = eir;
+
+        if (new_irq) {
+            /* Increment the GIC pulse sequencer.  m_sig_irq_seq.read() returns
+             * the current committed value (not the pending async value), so
+             * even if this is called multiple times before a delta fires, each
+             * call writes the same +1 value — guaranteed ≠ current → the signal
+             * change event always fires exactly once per batch, waking irq_method
+             * to generate one GIC LOW→HIGH pulse per new IRQ event group.      */
+            m_sig_irq_seq.write(m_sig_irq_seq.read() + 1u);
+        }
     }
 
     /* ── b_transport ─────────────────────────────────────────────────────
@@ -367,19 +423,50 @@ private:
     }
 
     /* ── irq_method ──────────────────────────────────────────────────────
-     * Fires when the Usart core's IRQ sc_signals change (delta-cycle update).
-     * Drives the combined irq output port for an optional GIC.
-     * STATUS bits are NOT set here to avoid timing dependencies on when
-     * the SystemC scheduler processes the signal update.
+     * Fires when m_sig_irq_seq changes — i.e., whenever update_status_from_core()
+     * detects a new IRQ rising edge.  Generates a GIC LOW→HIGH pulse:
+     *   • This delta: drive irq LOW (ensures falling edge before next rising)
+     *   • Next delta: irq_pulse_method drives irq HIGH (rising edge for GIC)
+     *
+     * Always doing LOW→HIGH rather than conditional writes means the GIC sees
+     * a fresh rising edge for every IRQ event regardless of current irq level.
      * ──────────────────────────────────────────────────────────────────── */
     void irq_method()
     {
+        if (irq.size() > 0) irq->write(false);
+        m_irq_state = false;
+        m_irq_pulse_event.notify(sc_core::SC_ZERO_TIME);
+    }
+
+    /* ── irq_pulse_method ────────────────────────────────────────────────
+     * Second half of the LOW→HIGH GIC pulse: drive irq HIGH so the GIC
+     * latches the rising edge.
+     * ──────────────────────────────────────────────────────────────────── */
+    void irq_pulse_method()
+    {
+        m_irq_state = true;
+        if (irq.size() > 0) irq->write(true);
+    }
+
+    /* ── irq_deassert_method ─────────────────────────────────────────────
+     * Fires when any of the four IRQ sc_signals change (driven by the Usart
+     * core's updateIrqPulses / assertIrq).  When all sources are deasserted,
+     * drives irq LOW so the GIC does not continuously re-deliver the interrupt
+     * in level-sensitive mode and so the next event gets a proper rising edge.
+     *
+     * The coalescing race (write(false)+write(true) in the same b_transport)
+     * is NOT a problem here: if a new pulse fires simultaneously with an
+     * old pulse deassert, the net sc_signal value is HIGH (true), so
+     * `asserted` is true and we do NOT deassert.  The new interrupt is handled
+     * by irq_method (via m_sig_irq_seq).
+     * ──────────────────────────────────────────────────────────────────── */
+    void irq_deassert_method()
+    {
         bool asserted = m_sig_tbir.read() || m_sig_tir.read() ||
                         m_sig_rir.read()  || m_sig_eir.read();
-        if (asserted != m_irq_state) {
-            m_irq_state = asserted;
-            if (irq.size() > 0)
-                irq->write(m_irq_state);
+        if (!asserted && m_irq_state) {
+            m_irq_state = false;
+            if (irq.size() > 0) irq->write(false);
         }
     }
 };

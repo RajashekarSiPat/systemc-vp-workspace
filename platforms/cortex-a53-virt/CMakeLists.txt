@@ -69,6 +69,23 @@ if(AARCH64_GCC)
     )
     add_custom_target(cortex-a53-virt-fw3 ALL DEPENDS ${FW3_ELF})
 
+    # ---- hello_isr.elf — ISR/GICv2-based USART2 interrupt test ---------------
+    set(FW4_SRC "${CMAKE_SOURCE_DIR}/baremetal/cortex-a53/src/hello_isr.c")
+    set(FW4_ELF "${CMAKE_CURRENT_SOURCE_DIR}/hello_isr.elf")
+
+    add_custom_command(
+        OUTPUT  ${FW4_ELF}
+        COMMAND ${AARCH64_GCC}
+            -nostdlib -static
+            -Ttext=0x80000000 -e _start
+            -Wl,--build-id=none -Wl,-n
+            -o ${FW4_ELF}
+            ${FW4_SRC}
+        DEPENDS ${FW4_SRC}
+        COMMENT "Cross-compiling hello_isr.elf (AArch64 GICv2 ISR test)"
+    )
+    add_custom_target(cortex-a53-virt-fw-isr ALL DEPENDS ${FW4_ELF})
+
 else()
     message(WARNING
         "aarch64-linux-gnu-gcc not found. "
