@@ -13,3 +13,4 @@
 
 add_subdirectory(usart)
 add_subdirectory(usart2)
+add_subdirectory(serial_bridge)

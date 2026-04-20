@@ -29,6 +29,13 @@
             "command": "LD_LIBRARY_PATH=qbox/build/install/lib:qbox/build/install/lib/qbox-2.0:qbox/build/install/lib/libqemu:build ./build/platforms/cortex-a53-virt/cortex-a53-virt-vp --gs_luafile platforms/cortex-a53-virt/conf_usart2.lua",
             "group": "test",
             "presentation": { "reveal": "always", "panel": "shared" }
+        },
+        {
+            "label": "run: fullduplex (A↔B interrupt test)",
+            "type": "shell",
+            "command": "LD_LIBRARY_PATH=qbox/build/install/lib:qbox/build/install/lib/qbox-2.0:qbox/build/install/lib/libqemu:build ./build/platforms/cortex-a53-virt/cortex-a53-virt-vp --gs_luafile platforms/cortex-a53-virt/conf_fullduplex.lua",
+            "group": "test",
+            "presentation": { "reveal": "always", "panel": "shared" }
         }
     ]
 }

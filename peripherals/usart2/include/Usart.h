@@ -149,6 +149,32 @@ SC_MODULE(Usart)
     bool get_direct_mem_ptr(tlm::tlm_generic_payload &trans,
                             tlm::tlm_dmi            &dmi_data);
 
+    // =========================================================================
+    // Direct RX injection — bypasses the serial RX state machine.
+    // Used by the QBOX wrapper to bridge two USART instances without
+    // requiring baud-rate accurate serial framing.
+    // Returns true if the byte was accepted, false on overrun.
+    // =========================================================================
+    bool rx_inject(uint8_t byte);
+
+    // Advance peripheral state to the current simulation time.
+    // Call before reading interrupt status from outside the module so that
+    // baud-timed interrupts (TIR, RIR) are up to date.
+    void sync() { advance(sc_core::sc_time_stamp()); }
+
+    // =========================================================================
+    // IRQ assertion-state accessors
+    // =========================================================================
+    // In QBOX's multithreaded model, sc_signal updates are deferred to the
+    // next delta cycle (the SystemC scheduler thread), which does not run
+    // while QEMU is executing b_transport callbacks.  Reading the assert
+    // timestamp directly (SC_ZERO_TIME = de-asserted) gives the correct state
+    // without requiring a delta-cycle round-trip.
+    bool is_tbir_asserted() const { return m_tbir_assert_time != sc_core::SC_ZERO_TIME; }
+    bool is_tir_asserted()  const { return m_tir_assert_time  != sc_core::SC_ZERO_TIME; }
+    bool is_rir_asserted()  const { return m_rir_assert_time  != sc_core::SC_ZERO_TIME; }
+    bool is_eir_asserted()  const { return m_eir_assert_time  != sc_core::SC_ZERO_TIME; }
+
 private:
     // =========================================================================
     // Register bank

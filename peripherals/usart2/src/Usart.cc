@@ -804,6 +804,9 @@ void Usart::updateIrqPulses(sc_time now)
 
     auto check = [&](sc_time &assert_time, sc_out<bool> &port, const char *n) {
         if (assert_time == SC_ZERO_TIME) return; // not asserted
+        // Guard against sc_time underflow: assert_time may be 1 ps (clamped
+        // from t=0 in assertIrq) while now is still SC_ZERO_TIME.
+        if (now < assert_time) return;
         if ((now - assert_time) >= pulse_width) {
             port.write(false);
             assert_time = SC_ZERO_TIME;
@@ -991,6 +994,60 @@ void Usart::transferRSR(bool oe, bool fe, bool pe)
 }
 
 // =============================================================================
+// Direct RX injection
+// =============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// rx_inject — inject a byte directly into the RBUF, bypassing the RX state
+// machine and serial pin simulation.
+//
+// Used by Usart2 when data arrives via a biflow_socket bridge (SerialBridge)
+// rather than via the rxd serial pin.
+//
+// Packing matches what transferRSR() produces for each mode:
+//   Non-parity (1, 3, 7): packed = raw byte value (m_rsr accumulates LSB-first)
+//   Parity (4, 5):        packed = (byte << 1) | par_bit
+//
+// Returns true if accepted, false on overrun.
+// ─────────────────────────────────────────────────────────────────────────────
+bool Usart::rx_inject(uint8_t byte)
+{
+    if (!m_con.fields.R || !m_con.fields.REN) {
+        DBG(2, "rx_inject: dropped — module not running or RX disabled");
+        return false;
+    }
+    if (m_rbuf_full) {
+        // Overrun: set OE flag and optionally fire EIR
+        m_con.fields.OE = 1u;
+        if (m_con.fields.OEN)
+            assertIrq(m_eir_assert_time, eir, "eir");
+        DBG(2, "rx_inject: OVERRUN — byte=0x" << std::hex << static_cast<unsigned>(byte)
+               << std::dec);
+        return false;
+    }
+    uint8_t  mode = m_con.fields.M;
+    uint32_t packed;
+    if (usart_mode_has_hw_parity(mode)) {
+        // Parity modes 4 (7+P) and 5 (8+P): data left-shifted, parity at bit 0
+        uint8_t nbits    = usart_data_bits(mode);
+        bool    even_par = computeEvenParity(byte, nbits);
+        bool    par      = m_con.fields.ODD ? !even_par : even_par;
+        packed = ((static_cast<uint32_t>(byte) << 1u) & RBUF_DATA_MASK) |
+                 (par ? 1u : 0u);
+    } else {
+        // Non-parity modes (1, 3, 7): raw accumulation — same layout as m_rsr
+        // bit0=D0, ..., bit7=D7  (bit8=D8 for mode 3 only)
+        packed = static_cast<uint32_t>(byte) & RBUF_DATA_MASK;
+    }
+    m_rbuf.fields.DATA = packed;
+    m_rbuf_full        = true;
+    DBG(2, "rx_inject: byte=0x" << std::hex << static_cast<unsigned>(byte)
+           << " packed=0x" << packed << " mode=" << +mode << std::dec);
+    assertIrq(m_rir_assert_time, rir, "rir");
+    return true;
+}
+
+// =============================================================================
 // IRQ assertion
 // =============================================================================
 
@@ -1005,7 +1062,13 @@ void Usart::assertIrq(sc_time       &assert_time,
                        const char    *irq_name)
 {
     DBG(4, __PRETTY_FUNCTION__ << " irq=" << irq_name);
-    assert_time = sc_time_stamp();
+    sc_core::sc_time t = sc_core::sc_time_stamp();
+    // SC_ZERO_TIME is the "not asserted" sentinel used by is_*_asserted() and
+    // updateIrqPulses().  If the assertion happens at t=0 we bump to 1 ps so
+    // the sentinel comparison never collides with a genuine assertion time.
+    if (t == sc_core::SC_ZERO_TIME)
+        t = sc_core::sc_time(1, sc_core::SC_PS);
+    assert_time = t;
     port.write(true);
 }
 

@@ -37,6 +37,20 @@ if(AARCH64_GCC OR (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR))
             COMMENT "Cross-compiling hello_usart.elf (Cortex-A53 AArch64)"
         )
         add_custom_target(cortex-a53-firmware ALL DEPENDS ${FW_OUT})
+
+        set(FW_FD_OUT "${CMAKE_SOURCE_DIR}/platforms/cortex-a53-virt/hello_fullduplex.elf")
+        add_custom_command(
+            OUTPUT  ${FW_FD_OUT}
+            COMMAND ${AARCH64_GCC}
+                -nostdlib -static
+                -Ttext=0x80000000 -e _start
+                -Wl,--build-id=none -Wl,-n
+                -o ${FW_FD_OUT}
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/hello_fullduplex.c
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/hello_fullduplex.c
+            COMMENT "Cross-compiling hello_fullduplex.elf (Cortex-A53 AArch64)"
+        )
+        add_custom_target(cortex-a53-virt-fw-fullduplex ALL DEPENDS ${FW_FD_OUT})
     endif()
 else()
     message(STATUS

@@ -46,6 +46,29 @@
                 }
             ],
             "preLaunchTask": "cmake: build"
+        },
+        {
+            "name": "Debug: fullduplex (A↔B interrupt test)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/platforms/cortex-a53-virt/cortex-a53-virt-vp",
+            "args": ["--gs_luafile", "platforms/cortex-a53-virt/conf_fullduplex.lua"],
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "LD_LIBRARY_PATH",
+                    "value": "${workspaceFolder}/qbox/build/install/lib:${workspaceFolder}/qbox/build/install/lib/qbox-2.0:${workspaceFolder}/qbox/build/install/lib/libqemu:${workspaceFolder}/build"
+                }
+            ],
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake: build"
         }
     ]
 }

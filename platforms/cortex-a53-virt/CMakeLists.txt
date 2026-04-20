@@ -52,6 +52,23 @@ if(AARCH64_GCC)
         COMMENT "Cross-compiling hello_usart2.elf for AArch64"
     )
     add_custom_target(cortex-a53-virt-fw2 ALL DEPENDS ${FW2_ELF})
+    # ---- hello_fullduplex.elf — full-duplex USART2 interrupt test ----------
+    set(FW3_SRC "${CMAKE_SOURCE_DIR}/baremetal/cortex-a53/src/hello_fullduplex.c")
+    set(FW3_ELF "${CMAKE_CURRENT_SOURCE_DIR}/hello_fullduplex.elf")
+
+    add_custom_command(
+        OUTPUT  ${FW3_ELF}
+        COMMAND ${AARCH64_GCC}
+            -nostdlib -static
+            -Ttext=0x80000000 -e _start
+            -Wl,--build-id=none -Wl,-n
+            -o ${FW3_ELF}
+            ${FW3_SRC}
+        DEPENDS ${FW3_SRC}
+        COMMENT "Cross-compiling hello_fullduplex.elf for AArch64"
+    )
+    add_custom_target(cortex-a53-virt-fw3 ALL DEPENDS ${FW3_ELF})
+
 else()
     message(WARNING
         "aarch64-linux-gnu-gcc not found. "
@@ -61,5 +78,8 @@ else()
         "baremetal/cortex-a53/src/hello_usart.c\n"
         "  aarch64-linux-gnu-gcc -nostdlib -static -Ttext=0x80000000 -e _start "
         "-Wl,--build-id=none -Wl,-n -o platforms/cortex-a53-virt/hello_usart2.elf "
-        "baremetal/cortex-a53/src/hello_usart2.c")
+        "baremetal/cortex-a53/src/hello_usart2.c\n"
+        "  aarch64-linux-gnu-gcc -nostdlib -static -Ttext=0x80000000 -e _start "
+        "-Wl,--build-id=none -Wl,-n -o platforms/cortex-a53-virt/hello_fullduplex.elf "
+        "baremetal/cortex-a53/src/hello_fullduplex.c")
 endif()

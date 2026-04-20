@@ -1,47 +1,58 @@
 /*
  * usart2.h — QBOX wrapper for the full-featured Usart peripheral model.
  *
- * Integrates the 4-file USART model (Usart.h / Usart.cc / Usart_types.h /
- * Usart_regdefs.h) from peripherals/usart2/ into the GreenSocs QBOX
- * ModuleFactory + biflow_socket framework.
- *
  * ── Architecture ─────────────────────────────────────────────────────────────
  *
  *   CPU ──TLM──► target_socket (Usart2) ──► Usart::bus (core model)
  *
  *   TX: TBUF write intercepted in b_transport → backend_socket.enqueue(byte)
- *       Usart core still receives the write to update internal state.
+ *       Usart core still receives the write to update internal state/IRQs.
  *
- *   IRQ: Usart {tbir,tir,rir,eir} signals combined → single irq output.
+ *   RX: backend_socket receives bytes → rx_inject() loads them directly into
+ *       the Usart core's RBUF (bypasses baud-rate serial framing).
  *
- * ── Integration notes ────────────────────────────────────────────────────────
+ *   IRQ: Four IRQ outputs (tbir, tir, rir, eir) combined → single irq output.
+ *       A sticky STATUS register (offset 0x20) records which IRQs fired.
  *
- *   • TBUF writes are intercepted and sent directly to the char backend.
- *     This gives correct byte-level console output without timing-accurate
- *     baud simulation.  The core b_transport is still called to keep its
- *     internal state (advance, BG counter, IRQ pulses) consistent.
+ * ── STATUS register (offset 0x20) ────────────────────────────────────────────
  *
- *   • Usart::b_transport subtracts base_addr from the transaction address.
- *     QBOX's router delivers the offset (not the full physical address), so
- *     b_transport temporarily adds m_usart.base_addr before forwarding and
- *     restores it after.
+ *   Bit  Mask         Description
+ *   0    STATUS_TBIR  TX buffer empty IRQ fired (TBUF freed into TSR)
+ *   1    STATUS_TIR   TX complete IRQ fired (all bits shifted out)
+ *   2    STATUS_RIR   RX data ready IRQ fired (RBUF has valid data)
+ *   3    STATUS_EIR   Error IRQ fired (overrun, framing, or parity)
  *
- *   • RX injection (char backend → Usart RBUF) is stubbed.  The bit-level
- *     rxd pin model requires scheduling serial frames; for now incoming bytes
- *     are discarded and flow-control credit is returned.
+ *   Read: returns current sticky status.
+ *   Write: write-1-to-clear (W1C) — firmware clears bits after handling.
  *
- *   • Clock: driven by CCI param clk_hz (default 100 MHz) written to
- *     m_sig_clk in start_of_simulation().
+ * ── STATUS update strategy ────────────────────────────────────────────────────
  *
- *   • Reset: held de-asserted (m_sig_rst = false) throughout simulation.
+ *   In QBOX's multithread-unconstrained model, QEMU calls b_transport from its
+ *   own OS thread.  sc_signal::write() inside b_transport schedules a delta-
+ *   cycle update, but the SystemC scheduler thread does not run until QEMU
+ *   yields at a quantum boundary.  This means irq_method() (sensitive to
+ *   sc_signals) would not fire during a tight QEMU STATUS-polling loop.
+ *
+ *   To avoid this, STATUS bits are updated SYNCHRONOUSLY within b_transport
+ *   by reading the Usart core's IRQ assertion timestamps directly (via
+ *   is_tbir_asserted() etc.), bypassing the sc_signal path entirely.
+ *   update_status_from_core() is called:
+ *     • After every TBUF write (catches TBIR)
+ *     • Inside rx_receive after rx_inject (catches RIR / EIR)
+ *     • In the STATUS read handler after m_usart.sync() (catches TIR)
+ *
+ *   irq_method() is still registered and still drives the irq output port
+ *   for use with a GIC, but it no longer owns the STATUS register.
  */
 
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <systemc>
 #include "tlm.h"
 #include "tlm_utils/simple_target_socket.h"
+#include "tlm_utils/simple_initiator_socket.h"
 #include <cci_configuration>
 
 #include <ports/initiator-signal-socket.h>
@@ -50,7 +61,6 @@
 #include <scp/report.h>
 #include <tlm_sockets_buswidth.h>
 
-#include "tlm_utils/simple_initiator_socket.h"
 #include "Usart.h"
 #include "Usart_types.h"
 #include "Usart_regdefs.h"
@@ -63,10 +73,10 @@ public:
     /* TLM register interface — name must match Lua "target_socket = {}" */
     tlm_utils::simple_target_socket<Usart2, DEFAULT_TLM_BUSWIDTH> socket;
 
-    /* Character-stream backend (char_backend_stdio) */
+    /* Character-stream / bridge backend */
     gs::biflow_socket<Usart2> backend_socket;
 
-    /* Combined interrupt output */
+    /* Combined interrupt output (SC_ZERO_OR_MORE_BOUND — optional GIC) */
     InitiatorSignalSocket<bool> irq;
 
     SC_HAS_PROCESS(Usart2);
@@ -86,17 +96,19 @@ public:
         , m_sig_rir("sig_rir")
         , m_sig_eir("sig_eir")
         , m_bus_fwd("bus_fwd")
-        , m_clk_hz("clk_hz", 100000000ULL, "Peripheral clock frequency in Hz (default 100 MHz)")
+        , m_clk_hz("clk_hz", 100000000ULL,
+                   "Peripheral clock frequency in Hz (default 100 MHz)")
         , m_irq_state(false)
+        , m_status(0u)
+        , m_irq_tbir_prev(false)
+        , m_irq_tir_prev(false)
+        , m_irq_rir_prev(false)
+        , m_irq_eir_prev(false)
     {
         SCP_TRACE(()) << "Usart2 constructor";
 
-        /* Bind internal initiator socket to Usart core's bus target socket.
-         * This satisfies SystemC's "all ports must be bound" check and lets
-         * us forward TLM transactions through the proper socket path. */
         m_bus_fwd.bind(m_usart.bus);
 
-        /* Bind all Usart core ports to internal signals */
         m_usart.usartClkIn.bind(m_sig_clk);
         m_usart.rst.bind(m_sig_rst);
         m_usart.txd.bind(m_sig_txd);
@@ -108,10 +120,11 @@ public:
 
         socket.register_b_transport(this, &Usart2::b_transport);
         backend_socket.register_b_transport(this, &Usart2::rx_receive);
-        /* NOTE: do NOT call backend_socket.can_receive_set() here.
-         * The biflow control initiator is unbound at construction time.
-         * Call it in start_of_simulation() instead (Rule 1). */
+        /* do NOT call can_receive_set() here — sockets not yet bound */
 
+        /* irq_method: drives the GIC output when sc_signals update.
+         * NOTE: STATUS bits are NOT set here; they are updated synchronously
+         * in b_transport / rx_receive to avoid delta-cycle timing issues. */
         SC_METHOD(irq_method);
         sensitive << m_sig_tbir << m_sig_tir << m_sig_rir << m_sig_eir;
         dont_initialize();
@@ -119,13 +132,21 @@ public:
 
     void start_of_simulation() override
     {
-        /* Sockets now bound: safe to configure flow control */
-        backend_socket.can_receive_set(RX_FIFO_DEPTH);
-
-        /* Hold reset de-asserted throughout simulation */
+        /* Use can_receive_any() (INFINITE_VALUE) rather than can_receive_set(N).
+         *
+         * can_receive_set(N) sends ABSOLUTE_VALUE to the peer, which calls
+         * async_attach_suspending() on the peer's m_send_event.  When QEMU's
+         * b_transport thread later delivers bytes (via force_send chain) and
+         * the peer calls enqueue() → m_send_event.notify(), the notify may
+         * try to acquire the SystemC kernel lock while the SystemC thread holds
+         * it — ABBA deadlock.
+         *
+         * can_receive_any() sends INFINITE_VALUE, sets m_infinite=true on the
+         * peer and does NOT call async_attach_suspending(), making it safe for
+         * any thread to enqueue bytes on the peer socket. */
+        backend_socket.can_receive_any();
         m_sig_rst.write(false);
 
-        /* Drive the clock period into the Usart core */
         uint64_t hz = m_clk_hz.get_value();
         if (hz > 0u) {
             double period_s = 1.0 / static_cast<double>(hz);
@@ -136,34 +157,140 @@ public:
     }
 
 private:
-    static constexpr int RX_FIFO_DEPTH = 16;
+    /* ── Compile-time constants ─────────────────────────────────────────── */
+    static constexpr int      RX_FIFO_DEPTH        = 16;
+    static constexpr uint64_t USART2_STATUS_OFFSET = 0x20u;
 
-    Usart                                 m_usart;
+    /* STATUS register bit masks (sticky, W1C) */
+    static constexpr uint32_t STATUS_TBIR = (1u << 0);
+    static constexpr uint32_t STATUS_TIR  = (1u << 1);
+    static constexpr uint32_t STATUS_RIR  = (1u << 2);
+    static constexpr uint32_t STATUS_EIR  = (1u << 3);
+
+    /* ── Sub-modules and sockets ────────────────────────────────────────── */
+    Usart m_usart;
     tlm_utils::simple_initiator_socket<Usart2, DEFAULT_TLM_BUSWIDTH> m_bus_fwd;
 
-    sc_core::sc_signal<sc_core::sc_time>  m_sig_clk;
-    sc_core::sc_signal<bool>              m_sig_rst;
-    sc_core::sc_signal<USART_TxRx_Tlm>   m_sig_txd;
-    sc_core::sc_signal<USART_TxRx_Tlm>   m_sig_rxd;
-    sc_core::sc_signal<bool>              m_sig_tbir;
-    sc_core::sc_signal<bool>              m_sig_tir;
-    sc_core::sc_signal<bool>              m_sig_rir;
-    sc_core::sc_signal<bool>              m_sig_eir;
+    /* ── Internal signals ───────────────────────────────────────────────── */
+    sc_core::sc_signal<sc_core::sc_time> m_sig_clk;
+    sc_core::sc_signal<bool>             m_sig_rst;
+    sc_core::sc_signal<USART_TxRx_Tlm>  m_sig_txd;
+    sc_core::sc_signal<USART_TxRx_Tlm>  m_sig_rxd;
+    /* SC_MANY_WRITERS: the Usart core drives these from two process contexts
+     * (sendall SC_METHOD via rx_inject, and jobs_handler SC_THREAD via sync/
+     * advance). SC_ONE_WRITER (default) would raise E115; SC_MANY_WRITERS
+     * suppresses that check while still delivering value-change events. */
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_tbir;
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_tir;
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_rir;
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_eir;
 
-    cci::cci_param<uint64_t>              m_clk_hz;
-    bool                                  m_irq_state;
+    /* ── CCI parameters ─────────────────────────────────────────────────── */
+    cci::cci_param<uint64_t> m_clk_hz;
 
-    /* ------------------------------------------------------------------ */
-    /* b_transport — intercept TBUF writes, forward all to Usart core     */
-    /* ------------------------------------------------------------------ */
+    /* ── GIC IRQ output state ───────────────────────────────────────────── */
+    bool m_irq_state;
+
+    /* ── STATUS register (sticky; updated directly from IRQ assert times) ─ */
+    uint32_t m_status;
+
+    /* Previous IRQ assertion states — used for rising-edge detection.
+     * These track Usart::is_*_asserted(), NOT the sc_signal values. */
+    bool m_irq_tbir_prev;
+    bool m_irq_tir_prev;
+    bool m_irq_rir_prev;
+    bool m_irq_eir_prev;
+
+    /* ── update_status_from_core ─────────────────────────────────────────
+     * Poll the Usart core's IRQ assert timestamps and set sticky STATUS bits
+     * on rising edges.  Must be called after any operation that may fire an
+     * IRQ (TBUF write, rx_inject, sync).  Safe to call from QEMU's thread
+     * since it only reads/writes module-private data — no SystemC scheduler
+     * interaction required.
+     * ──────────────────────────────────────────────────────────────────── */
+    void update_status_from_core()
+    {
+        bool tbir = m_usart.is_tbir_asserted();
+        bool tir  = m_usart.is_tir_asserted();
+        bool rir  = m_usart.is_rir_asserted();
+        bool eir  = m_usart.is_eir_asserted();
+
+        if (tbir && !m_irq_tbir_prev) {
+            m_status |= STATUS_TBIR;
+            SCP_INFO(()) << "TBIR fired at " << sc_core::sc_time_stamp()
+                         << "  (TX buffer freed into TSR)";
+        }
+        if (tir && !m_irq_tir_prev) {
+            m_status |= STATUS_TIR;
+            SCP_INFO(()) << "TIR  fired at " << sc_core::sc_time_stamp()
+                         << "  (TX frame complete)";
+        }
+        if (rir && !m_irq_rir_prev) {
+            m_status |= STATUS_RIR;
+            SCP_INFO(()) << "RIR  fired at " << sc_core::sc_time_stamp()
+                         << "  (RX data ready in RBUF)";
+        }
+        if (eir && !m_irq_eir_prev) {
+            m_status |= STATUS_EIR;
+            SCP_INFO(()) << "EIR  fired at " << sc_core::sc_time_stamp()
+                         << "  (error: OE/FE/PE)";
+        }
+
+        m_irq_tbir_prev = tbir;
+        m_irq_tir_prev  = tir;
+        m_irq_rir_prev  = rir;
+        m_irq_eir_prev  = eir;
+    }
+
+    /* ── b_transport ─────────────────────────────────────────────────────
+     * Handles:
+     *   offset 0x20: STATUS register (read=sticky bits, write=W1C)
+     *   offset 0x04: TBUF write — intercept byte → backend, forward to core
+     *   all others:  forward directly to Usart core
+     * ──────────────────────────────────────────────────────────────────── */
     void b_transport(tlm::tlm_generic_payload& trans, sc_core::sc_time& delay)
     {
-        /* Router delivers offset-from-base, not the full physical address */
         uint64_t offset = trans.get_address();
 
-        /* Intercept TBUF writes: forward byte directly to the char backend.
-         * This gives immediate console output without relying on the baud-rate
-         * serial simulation (which requires many clock ticks per bit).       */
+        /* ── STATUS register ────────────────────────────────────────────── */
+        if (offset == USART2_STATUS_OFFSET) {
+            /* Do NOT call m_usart.sync()/advance() here.
+             *
+             * In QBOX multithread-unconstrained, STATUS reads are called from
+             * jobs_handler (QEMU's b_transport goes through RunOnSysc).  If
+             * m_usart.sync() → advance(sc_time_stamp()) is called here and the
+             * simulation time has advanced far ahead of the last advance() call
+             * (because SystemC jumped forward while QEMU ran between quanta),
+             * advance() would loop over potentially millions of baud-clock ticks,
+             * causing a multi-second stall for each STATUS read in the polling
+             * loop — effectively a hang.
+             *
+             * All STATUS bits are already kept up-to-date synchronously:
+             *   TBIR / TIR : set in update_status_from_core() after every
+             *                TBUF write (the TBUF write forwards to the core
+             *                via m_bus_fwd which calls advance internally).
+             *   RIR / EIR  : set in rx_receive() via update_status_from_core()
+             *                immediately when the biflow byte arrives.
+             *
+             * The STATUS register is sticky (W1C) so no update is missed.
+             * For Test 5 (TIR), TIR fires during the TBUF write's advance()
+             * call and is captured there; no additional advance is needed here.
+             */
+
+            if (trans.get_command() == tlm::TLM_READ_COMMAND) {
+                std::memcpy(trans.get_data_ptr(), &m_status, sizeof(m_status));
+                trans.set_dmi_allowed(false);
+                trans.set_response_status(tlm::TLM_OK_RESPONSE);
+            } else {
+                uint32_t wval = 0u;
+                std::memcpy(&wval, trans.get_data_ptr(), sizeof(wval));
+                m_status &= ~wval; /* write-1-to-clear */
+                trans.set_response_status(tlm::TLM_OK_RESPONSE);
+            }
+            return;
+        }
+
+        /* ── TBUF write: send byte to biflow backend ────────────────────── */
         if (trans.get_command() == tlm::TLM_WRITE_COMMAND &&
             offset == USART_TBUF_OFFSET)
         {
@@ -171,45 +298,86 @@ private:
             unsigned       len = trans.get_data_length();
             uint32_t       val = 0u;
             switch (len) {
-            case 1: val = *ptr; break;
+            case 1: val = *ptr;                                     break;
             case 2: val = *reinterpret_cast<const uint16_t*>(ptr); break;
             case 4: val = *reinterpret_cast<const uint32_t*>(ptr); break;
             default: break;
             }
-            backend_socket.enqueue(static_cast<uint8_t>(val & 0xFFu));
+            /* Send byte to biflow backend synchronously via force_send.
+             *
+             * biflow_socket::enqueue() posts to an internal queue and notifies
+             * an async_event.  In QBOX's multithread-unconstrained model the
+             * QEMU thread calls b_transport (and therefore this code) while
+             * holding no SystemC locks, but async_event::notify() calls
+             * async_request_update() which—in some SystemC 3.0.2 builds—
+             * acquires the kernel update mutex.  That mutex may already be
+             * held by the SystemC scheduler thread, causing a deadlock.
+             *
+             * force_send() calls output_socket->b_transport() directly without
+             * going through the async queue, so it is safe to call from any
+             * thread context.  The chain:
+             *   usart2_a → SerialBridge.recv_from_a → socket_b.enqueue
+             *   → (async) → usart2_b.rx_receive → rx_inject → RIR
+             * remains asynchronous for the B side (socket_b is in a
+             * SystemC context), so no further deadlock arises there. */
+            {
+                uint8_t byte = static_cast<uint8_t>(val & 0xFFu);
+                tlm::tlm_generic_payload fwd_txn;
+                fwd_txn.set_command(tlm::TLM_WRITE_COMMAND);
+                fwd_txn.set_data_ptr(&byte);
+                fwd_txn.set_data_length(1);
+                fwd_txn.set_streaming_width(1);
+                fwd_txn.set_byte_enable_ptr(nullptr);
+                fwd_txn.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
+                backend_socket.force_send(fwd_txn);
+            }
         }
 
-        /* Forward to Usart core so advance(), BG counter, TBUF/TSR state,
-         * and IRQ pulse timestamps all stay consistent.
-         * Usart::b_transport computes: offset = addr - base_addr
-         * We receive the offset; restore the full address before forwarding. */
+        /* ── Forward all other offsets to Usart core ───────────────────── */
         trans.set_address(offset + m_usart.base_addr.get_value());
         m_bus_fwd->b_transport(trans, delay);
-        trans.set_address(offset); /* restore for the router */
+        trans.set_address(offset);
+
+        /* ── Capture TBIR (and any other IRQs) that fired during the above */
+        update_status_from_core();
     }
 
-    /* ------------------------------------------------------------------ */
-    /* rx_receive — stub: incoming bytes from the char backend            */
-    /* ------------------------------------------------------------------ */
+    /* ── rx_receive ──────────────────────────────────────────────────────
+     * Called when the biflow backend (bridge or stdio) delivers bytes.
+     * Inject each byte directly into the Usart core's RBUF.
+     * STATUS[RIR] / STATUS[EIR] are set here via update_status_from_core().
+     * ──────────────────────────────────────────────────────────────────── */
     void rx_receive(tlm::tlm_generic_payload& txn, sc_core::sc_time& /*t*/)
     {
-        /* TODO: inject bytes into the Usart core via the rxd pin interface.
-         * Requires scheduling serial frames at baud-rate intervals.
-         * For now, discard and restore flow-control credit.               */
-        backend_socket.can_receive_more(txn.get_data_length());
+        uint8_t* ptr = txn.get_data_ptr();
+        unsigned len = txn.get_data_length();
+
+        for (unsigned i = 0u; i < len; ++i) {
+            if (!m_usart.rx_inject(ptr[i])) {
+                SCP_WARN(()) << "rx_receive: overrun — byte 0x"
+                             << std::hex << static_cast<unsigned>(ptr[i])
+                             << " dropped (EIR fires if OEN=1)";
+            }
+            /* Capture RIR (accepted) or EIR (overrun, OEN=1) */
+            update_status_from_core();
+        }
+        /* No can_receive_more() — backend_socket uses can_receive_any() (infinite
+         * credits), so calling can_receive_more() would send DELTA_CHANGE on a
+         * socket with m_infinite=true, tripping sc_assert(m_infinite == false). */
     }
 
-    /* ------------------------------------------------------------------ */
-    /* irq_method — combine four interrupt outputs onto one line          */
-    /* ------------------------------------------------------------------ */
+    /* ── irq_method ──────────────────────────────────────────────────────
+     * Fires when the Usart core's IRQ sc_signals change (delta-cycle update).
+     * Drives the combined irq output port for an optional GIC.
+     * STATUS bits are NOT set here to avoid timing dependencies on when
+     * the SystemC scheduler processes the signal update.
+     * ──────────────────────────────────────────────────────────────────── */
     void irq_method()
     {
         bool asserted = m_sig_tbir.read() || m_sig_tir.read() ||
                         m_sig_rir.read()  || m_sig_eir.read();
         if (asserted != m_irq_state) {
             m_irq_state = asserted;
-            /* InitiatorSignalSocket is SC_ZERO_OR_MORE_BOUND; only drive it
-             * if connected to a GIC/interrupt controller in the platform. */
             if (irq.size() > 0)
                 irq->write(m_irq_state);
         }
