@@ -49,6 +49,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <unistd.h>   /* write() for async-signal-safe tracing */
 #include <systemc>
 #include "tlm.h"
 #include "tlm_utils/simple_target_socket.h"
@@ -101,10 +102,13 @@ public:
         , m_sig_irq_seq("sig_irq_seq")
         , m_irq_state(false)
         , m_status(0u)
-        , m_irq_tbir_prev(false)
+        , m_tbuf_write_count(0u)
+        , m_tbir_fired_count(0u)
         , m_irq_tir_prev(false)
-        , m_irq_rir_prev(false)
-        , m_irq_eir_prev(false)
+        , m_rx_accept_count(0u)
+        , m_rir_fired_count(0u)
+        , m_rx_overrun_count(0u)
+        , m_eir_fired_count(0u)
     {
         SCP_TRACE(()) << "Usart2 constructor";
 
@@ -229,13 +233,28 @@ private:
     /* ── STATUS register (sticky; updated directly from IRQ assert times) ─ */
     uint32_t m_status;
 
-    /* Previous IRQ assertion states — used for rising-edge detection in
-     * update_status_from_core().  Track Usart::is_*_asserted() (timestamp-based),
-     * not sc_signal values. */
-    bool m_irq_tbir_prev;
-    bool m_irq_tir_prev;
-    bool m_irq_rir_prev;
-    bool m_irq_eir_prev;
+    /* Per-event counters for reliable edge detection in same-quantum VP mode.
+     *
+     * In QBOX multithread-unconstrained, all b_transport calls within one
+     * quantum share the same sc_time_stamp().  advance() returns early when
+     * now <= m_last_advance_time, so the Usart core's 2-period IRQ pulses
+     * never expire.  is_tbir_asserted() stays true indefinitely, making
+     * prev-based rising-edge detection permanently blind after the first fire.
+     *
+     * Solution: count TBUF writes vs. TBIR fires.  One TBIR per write,
+     * one RIR per successful rx_inject, one EIR per overrun — regardless
+     * of whether the baud clock has advanced.
+     *
+     * TIR (TX-frame complete) still uses prev-based detection because it
+     * requires stepTx() to run via advance().  In same-quantum mode TIR
+     * will not fire; Test 5 is expected to fail in that scenario.          */
+    unsigned int m_tbuf_write_count;   /* incremented per TBUF write in b_transport  */
+    unsigned int m_tbir_fired_count;   /* matched to m_tbuf_write_count when TBIR set */
+    bool         m_irq_tir_prev;       /* for TIR rising-edge detection (prev-based)  */
+    unsigned int m_rx_accept_count;    /* incremented per successful rx_inject call   */
+    unsigned int m_rir_fired_count;    /* matched to m_rx_accept_count when RIR set   */
+    unsigned int m_rx_overrun_count;   /* incremented per failed rx_inject (overrun)  */
+    unsigned int m_eir_fired_count;    /* matched to m_rx_overrun_count when EIR set  */
 
     /* Event for the second half of the GIC LOW→HIGH pulse: irq_method() drives
      * LOW and notifies this event; irq_pulse_method() drives HIGH next delta. */
@@ -250,52 +269,73 @@ private:
      * ──────────────────────────────────────────────────────────────────── */
     void update_status_from_core()
     {
-        bool tbir = m_usart.is_tbir_asserted();
-        bool tir  = m_usart.is_tir_asserted();
-        bool rir  = m_usart.is_rir_asserted();
-        bool eir  = m_usart.is_eir_asserted();
+        /* No GIC connection — skip entirely.  USART_C (console) has irq.size()==0;
+         * generating m_sig_irq_seq events there creates unnecessary SC-scheduler
+         * churn on every put_char() call, which in practice causes the SC thread
+         * to thrash while QEMU is waiting for GIC interrupt delivery. */
+        if (irq.size() == 0u) return;
 
         bool new_irq = false;
 
-        if (tbir && !m_irq_tbir_prev) {
+        /* ── TBIR ─────────────────────────────────────────────────────────────
+         * Fire once per TBUF write.  We do NOT check is_tbir_asserted() here.
+         *
+         * In same-quantum VP execution, sc_time_stamp() is constant across all
+         * b_transport calls, so advance() returns early every time and the
+         * Usart core's 2-period IRQ pulse never expires.  is_tbir_asserted()
+         * therefore stays true indefinitely after the first TBUF write.  Using
+         * it as a rising-edge signal would leave m_irq_tbir_prev permanently
+         * stuck at true after the first interrupt, silencing all subsequent
+         * TBIR events.
+         *
+         * The write-count mismatch is sufficient: the Usart core's assertIrq
+         * for TBIR is always called (either by loadTSR immediately if TSR is
+         * idle, or by stepTx later — but in either case update_status_from_core
+         * is called right after the TBUF b_transport, and the count guarantees
+         * exactly one STATUS_TBIR set per write regardless of timing.          */
+        if (m_tbuf_write_count > m_tbir_fired_count) {
             m_status |= STATUS_TBIR;
+            m_tbir_fired_count = m_tbuf_write_count;
             new_irq = true;
-            SCP_INFO(()) << "TBIR fired at " << sc_core::sc_time_stamp()
-                         << "  (TX buffer freed into TSR)";
+            SCP_INFO(()) << "TBIR fired (tbuf_write_count=" << m_tbuf_write_count << ")";
         }
+
+        /* ── TIR ──────────────────────────────────────────────────────────────
+         * TX-frame complete — fires from stepTx() via advance().  In
+         * same-quantum mode advance() returns early so TIR never fires here;
+         * Test 5 is expected to fail in that scenario.  Prev-based detection
+         * is correct when advance does run (e.g., after a quantum boundary).  */
+        bool tir = m_usart.is_tir_asserted();
         if (tir && !m_irq_tir_prev) {
             m_status |= STATUS_TIR;
             new_irq = true;
             SCP_INFO(()) << "TIR  fired at " << sc_core::sc_time_stamp()
                          << "  (TX frame complete)";
         }
-        if (rir && !m_irq_rir_prev) {
+        m_irq_tir_prev = tir;
+
+        /* ── RIR ──────────────────────────────────────────────────────────────
+         * Fire once per successful rx_inject.  Same-quantum issue as TBIR:
+         * is_rir_asserted() stays true after the first injection; the accept-
+         * count prevents re-firing for the same injection event.              */
+        if (m_usart.is_rir_asserted() && m_rx_accept_count > m_rir_fired_count) {
             m_status |= STATUS_RIR;
+            m_rir_fired_count = m_rx_accept_count;
             new_irq = true;
-            SCP_INFO(()) << "RIR  fired at " << sc_core::sc_time_stamp()
-                         << "  (RX data ready in RBUF)";
+            SCP_INFO(()) << "RIR  fired (rx_accept_count=" << m_rx_accept_count << ")";
         }
-        if (eir && !m_irq_eir_prev) {
+
+        /* ── EIR ──────────────────────────────────────────────────────────────
+         * Fire once per overrun (failed rx_inject when RBUF full).            */
+        if (m_usart.is_eir_asserted() && m_rx_overrun_count > m_eir_fired_count) {
             m_status |= STATUS_EIR;
+            m_eir_fired_count = m_rx_overrun_count;
             new_irq = true;
-            SCP_INFO(()) << "EIR  fired at " << sc_core::sc_time_stamp()
-                         << "  (error: OE/FE/PE)";
+            SCP_INFO(()) << "EIR  fired (rx_overrun_count=" << m_rx_overrun_count << ")";
         }
 
-        m_irq_tbir_prev = tbir;
-        m_irq_tir_prev  = tir;
-        m_irq_rir_prev  = rir;
-        m_irq_eir_prev  = eir;
-
-        if (new_irq) {
-            /* Increment the GIC pulse sequencer.  m_sig_irq_seq.read() returns
-             * the current committed value (not the pending async value), so
-             * even if this is called multiple times before a delta fires, each
-             * call writes the same +1 value — guaranteed ≠ current → the signal
-             * change event always fires exactly once per batch, waking irq_method
-             * to generate one GIC LOW→HIGH pulse per new IRQ event group.      */
+        if (new_irq)
             m_sig_irq_seq.write(m_sig_irq_seq.read() + 1u);
-        }
     }
 
     /* ── b_transport ─────────────────────────────────────────────────────
@@ -386,6 +426,9 @@ private:
                 fwd_txn.set_byte_enable_ptr(nullptr);
                 fwd_txn.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
                 backend_socket.force_send(fwd_txn);
+            /* Count this write so update_status_from_core() fires exactly one
+             * TBIR per TBUF write, independent of whether advance() has run. */
+            ++m_tbuf_write_count;
             }
         }
 
@@ -409,12 +452,16 @@ private:
         unsigned len = txn.get_data_length();
 
         for (unsigned i = 0u; i < len; ++i) {
-            if (!m_usart.rx_inject(ptr[i])) {
+            if (m_usart.rx_inject(ptr[i])) {
+                /* Accepted: byte stored in RBUF, RIR asserted by core. */
+                ++m_rx_accept_count;
+            } else {
+                /* Overrun: RBUF full, EIR asserted by core (if OEN=1). */
+                ++m_rx_overrun_count;
                 SCP_WARN(()) << "rx_receive: overrun — byte 0x"
                              << std::hex << static_cast<unsigned>(ptr[i])
                              << " dropped (EIR fires if OEN=1)";
             }
-            /* Capture RIR (accepted) or EIR (overrun, OEN=1) */
             update_status_from_core();
         }
         /* No can_receive_more() — backend_socket uses can_receive_any() (infinite

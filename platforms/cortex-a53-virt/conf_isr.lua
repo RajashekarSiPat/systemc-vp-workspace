@@ -158,11 +158,25 @@ platform = {
     },
 
     -- -----------------------------------------------------------------------
+    -- Exiter: firmware writes 0 here to call sc_stop() cleanly.
+    -- -----------------------------------------------------------------------
+    exiter_0 = {
+        moduletype    = "exiter",
+        target_socket = {
+            address = 0x09010000,
+            size    = 0x1000,
+            bind    = "&router.initiator_socket",
+        },
+    },
+
+    -- -----------------------------------------------------------------------
     -- ELF loader
+    -- Override the firmware with ISR_ELF env var to run a single test:
+    --   ISR_ELF=.../hello_isr_t3.elf ./cortex-a53-virt-vp --gs_luafile conf_isr.lua
     -- -----------------------------------------------------------------------
     load = {
         moduletype       = "loader",
         initiator_socket = { bind = "&router.target_socket" },
-        { elf_file = base .. "hello_isr.elf" },
+        { elf_file = os.getenv("ISR_ELF") or (base .. "hello_isr.elf") },
     },
 }

@@ -28,6 +28,11 @@
  *   4. Multi    :  0xDE,0xAD,0xBE,0xEF A→B, each byte TBIR_A + RIR_B
  *   5. TIR      :  TX-complete via baud timing (may appear in same ISR as TBIR)
  *
+ * Selecting tests at compile time:
+ *   TEST_MASK bit N-1 enables Test N.  Default 0x1F runs all five.
+ *   To run only Test 3:  -DTEST_MASK=0x04
+ *   To run Tests 1 and 2: -DTEST_MASK=0x03
+ *
  * GICv3 register addresses (from conf_isr.lua):
  *   GICD base: 0x08000000   GICR base: 0x080A0000
  *   CPU interface: AArch64 system registers (ICC_*_EL1)
@@ -40,6 +45,10 @@
  *   0x80000000  _start (code)
  *   BSS region  g_vt[512] aligned to 2 KB — exception vector table
  */
+
+#ifndef TEST_MASK
+#define TEST_MASK 0x1Fu  /* run all five tests */
+#endif
 
 /* ── MMIO helpers ─────────────────────────────────────────────────────────── */
 #define MMIO32(a)  (*(volatile unsigned int *)(unsigned long)(a))
@@ -56,6 +65,9 @@
 #define UB_STATUS MMIO32(0x09003020UL)
 
 #define UC_TBUF   MMIO32(0x09004004UL)
+
+/* Exiter peripheral: any write calls sc_stop() in SystemC, ending the VP. */
+#define EXITER    MMIO32(0x09010000UL)
 
 /* CON_INIT: Mode1 | REN | OEN | R (8N1, receive enable, overrun-enable, run) */
 #define CON_INIT     0x8049u
@@ -127,12 +139,20 @@ static void enable_irq(void);
 static int  wait_n(unsigned int target);
 static int  find_event(unsigned int from, unsigned int irq_id,
                         unsigned int status_bit);
+static unsigned int test_begin(void);
 static void pass_test(const char *name);
 static void fail_test(const char *name, const char *why);
 static void put_char(char c);
 static void put_str(const char *s);
 static void put_hex(unsigned int v);
 static void isr_main(void);
+
+/* Individual test functions — each is self-contained and can run standalone. */
+static void test1(void);
+static void test2(void);
+static void test3(void);
+static void test4(void);
+static void test5(void);
 
 /* Naked functions — defined before helpers so they land first in .text.
  * irq_handler() is a normal C function called from irq_entry().            */
@@ -268,17 +288,258 @@ static void irq_handler(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * isr_main — test logic, called from _start with a valid SP
+ * test_begin — prepare for a new test
+ *
+ * Clears both STATUS registers and returns the current log count as the base
+ * for find_event() searches.  Does NOT read RBUF — the Usart model blocks on
+ * a read of an empty RBUF, so draining must only happen when data is known to
+ * be present (test1/test2 read RBUF after confirming RIR; test3 drains at end
+ * after the overrun; test4 drains within its loop).
  * ═══════════════════════════════════════════════════════════════════════════ */
-static void isr_main(void)
+static unsigned int test_begin(void)
+{
+    UA_STATUS = 0xFFFFFFFFu;    /* W1C: clear all sticky bits */
+    UB_STATUS = 0xFFFFFFFFu;
+    __asm__ volatile("" ::: "memory");
+    return g_log_count;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 1: A → B  (0x55)
+ * Expected: TBIR_A fires (USART_A INT), then RIR_B fires (USART_B INT).
+ * TIR_A may also appear if advance() completes the TX frame in one call.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test1(void)
+{
+    unsigned int base, data;
+
+    put_str("Test 1: A sends 0x55, expect TBIR_A + RIR_B\r\n");
+    base = test_begin();
+    UA_TBUF = 0x55u;
+
+    /* Wait for at least one event from each USART (min 2 total). */
+    if (!wait_n(base + 2u)) {
+        fail_test("T1", "IRQ timeout"); return;
+    }
+    if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
+        fail_test("T1-TBIR_A", "not in ISR log"); return;
+    }
+    put_str("  [ISR] TBIR_A confirmed\r\n");
+
+    if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
+        fail_test("T1-RIR_B", "not in ISR log"); return;
+    }
+    put_str("  [ISR] RIR_B  confirmed\r\n");
+
+    data = UB_RBUF & 0xFFu;
+    put_str("  RBUF_B="); put_hex(data); put_str("\r\n");
+    if (data == 0x55u) pass_test("Test1 A->B 0x55");
+    else               fail_test("Test1", "RBUF_B != 0x55");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 2: B → A  (0xAA)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test2(void)
+{
+    unsigned int base, data;
+
+    put_str("Test 2: B sends 0xAA, expect TBIR_B + RIR_A\r\n");
+    base = test_begin();
+    UB_TBUF = 0xAAu;
+
+    if (!wait_n(base + 2u)) {
+        fail_test("T2", "IRQ timeout"); return;
+    }
+    if (find_event(base, IRQ_USART_B, STATUS_TBIR) < 0) {
+        fail_test("T2-TBIR_B", "not in ISR log"); return;
+    }
+    put_str("  [ISR] TBIR_B confirmed\r\n");
+
+    if (find_event(base, IRQ_USART_A, STATUS_RIR) < 0) {
+        fail_test("T2-RIR_A", "not in ISR log"); return;
+    }
+    put_str("  [ISR] RIR_A  confirmed\r\n");
+
+    data = UA_RBUF & 0xFFu;
+    put_str("  RBUF_A="); put_hex(data); put_str("\r\n");
+    if (data == 0xAAu) pass_test("Test2 B->A 0xAA");
+    else               fail_test("Test2", "RBUF_A != 0xAA");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 3: Overrun / EIR
+ *   Step 1: send 0x11 → fills RBUF_B (RIR_B fires)
+ *   Step 2: send 0x22 while RBUF_B still full → overrun → EIR_B fires
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test3(void)
 {
     unsigned int base;
 
+    put_str("Test 3: Overrun — EIR_B after second byte\r\n");
+    base = test_begin();
+    UA_TBUF = 0x11u;
+
+    /* Wait for 2 events: TBIR_A (from the TBUF write) and RIR_B (from the
+     * biflow delivery to USART_B).  TBIR_A fires synchronously inside the
+     * b_transport for UA_TBUF; RIR_B fires asynchronously (next delta) via
+     * the bridge.  Waiting for count+1 could return after TBIR_A before
+     * RIR_B is logged, causing find_event(RIR_B) to fail spuriously.     */
+    if (!wait_n(base + 2u)) {
+        fail_test("T3-RIR_B", "first byte timeout"); return;
+    }
+    if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
+        fail_test("T3-RIR_B", "not in ISR log"); return;
+    }
+    put_str("  [ISR] RIR_B (RBUF_B full)\r\n");
+
+    /* Do NOT drain RBUF_B — the overrun only fires if RBUF is still full. */
+    base = g_log_count;
+    UA_TBUF = 0x22u;
+
+    /* Wait for 2 events: TBIR_A + EIR_B. */
+    if (!wait_n(base + 2u)) {
+        fail_test("T3-EIR_B", "EIR timeout"); return;
+    }
+    if (find_event(base, IRQ_USART_B, STATUS_EIR) < 0) {
+        fail_test("T3-EIR_B", "not in ISR log"); return;
+    }
+    put_str("  [ISR] EIR_B  confirmed (overrun)\r\n");
+    pass_test("Test3 Overrun EIR");
+    /* Drain the 0x11 byte left in RBUF_B from step 1 so test4 starts clean. */
+    (void)UB_RBUF;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 4: Multi-byte stream A → B  [0xDE, 0xAD, 0xBE, 0xEF]
+ * Each TBUF write fires TBIR_A + RIR_B (and possibly TIR_A).
+ * RBUF_B is drained after each byte so the next byte's RIR fires cleanly.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test4(void)
+{
+    static const unsigned int stream[4] = { 0xDEu, 0xADu, 0xBEu, 0xEFu };
+    unsigned int base, i;
+    int ok = 1;
+
+    put_str("Test 4: Multi-byte A->B [0xDE, 0xAD, 0xBE, 0xEF]\r\n");
+    (void)test_begin();     /* drain/clear; first per-byte base set in loop  */
+
+    for (i = 0u; i < 4u; ++i) {
+        unsigned int exp  = stream[i];
+        unsigned int data;
+
+        base = g_log_count;
+        UA_TBUF = exp;
+
+        if (!wait_n(base + 2u)) {
+            put_str("  timeout byte "); put_hex(exp); put_str("\r\n");
+            ok = 0; break;
+        }
+        if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
+            put_str("  TBIR_A missing for byte "); put_hex(exp); put_str("\r\n");
+            ok = 0; break;
+        }
+        if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
+            put_str("  RIR_B missing for byte "); put_hex(exp); put_str("\r\n");
+            ok = 0; break;
+        }
+
+        data = UB_RBUF & 0xFFu;
+        put_str("  [ISR] byte "); put_hex(i);
+        put_str(" sent="); put_hex(exp);
+        put_str(" got=");  put_hex(data);
+        put_str((data == exp) ? " OK\r\n" : " MISMATCH\r\n");
+        if (data != exp) { ok = 0; break; }
+    }
+    if (ok) pass_test("Test4 multi-byte");
+    else    fail_test("Test4 multi-byte", "mismatch or timeout");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 5: TIR — TX-frame complete interrupt
+ *
+ * Because advance() is lazy (called only from b_transport), it may
+ * process many baud ticks in one call.  When Tests 1-4 have run before
+ * this point, a long gap exists between the last advance() and this
+ * TBUF write; advance() processes all those ticks at once, completing
+ * the TX frame and firing both TBIR and TIR in a single b_transport.
+ * The ISR therefore logs {TBIR} and {TIR} in the same call.
+ *
+ * When running standalone (no prior tests), advance() starts fresh so
+ * the timing gap from reset to the TBUF write determines whether TBIR
+ * and TIR fire together or in separate b_transport calls.
+ *
+ * If TIR is not already in the log after waiting for TBIR (which can
+ * happen if the elapsed time spans exactly one frame), the firmware
+ * reads UA_CON periodically to drive advance() forward until TIR fires
+ * and the edge-triggered GIC delivers a second IRQ.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test5(void)
+{
+    unsigned int base, i;
+    int          tir_idx;
+
+    put_str("Test 5: TIR — TX-frame complete (ISR)\r\n");
+    base = test_begin();
+    UA_TBUF = 0x5Au;
+
+    /* Wait for at least TBIR_A */
+    if (!wait_n(base + 1u)) {
+        fail_test("T5-TBIR_A", "timeout"); return;
+    }
+    if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
+        fail_test("T5-TBIR_A", "not in ISR log"); return;
+    }
+    put_str("  [ISR] TBIR_A confirmed\r\n");
+
+    /* Check if TIR was already logged in the same (or a subsequent) ISR. */
+    tir_idx = find_event(base, IRQ_USART_A, STATUS_TIR);
+
+    if (tir_idx < 0) {
+        /* TIR not yet seen.  Drive advance() by reading UA_CON (any
+         * non-STATUS access goes through m_bus_fwd → advance()).
+         * TBIR de-asserts after 2 clock periods (~20 ns at 100 MHz),
+         * then TIR fires after the full baud frame (~3.2 µs at 100 MHz
+         * with BG=0 prescaler/2, 8N1).  The falling edge of irq_a after
+         * TBIR de-asserts, followed by the rising edge when TIR fires,
+         * gives the GIC a second edge trigger for IRQ 32.              */
+        for (i = 0u; i < 500u; ++i) {
+            volatile unsigned int dummy = UA_CON;  /* triggers advance() */
+            (void)dummy;
+            tir_idx = find_event(base, IRQ_USART_A, STATUS_TIR);
+            if (tir_idx >= 0) break;
+            /* A handful of NOPs advances simulation time a little between
+             * each advance() call, helping separate TBIR de-assertion
+             * from TIR assertion into distinct b_transport calls.       */
+            __asm__ volatile("nop\nnop\nnop\nnop\nnop" ::: "memory");
+        }
+    }
+
+    if (tir_idx >= 0) {
+        put_str("  [ISR] TIR_A  confirmed\r\n");
+        pass_test("Test5 TIR TX-complete");
+    } else {
+        put_str("  TIR not seen in ISR log after 500 advance() calls\r\n");
+        put_str("  STATUS_A="); put_hex(UA_STATUS); put_str("\r\n");
+        fail_test("Test5 TIR", "TIR never arrived");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * isr_main — test driver, called from _start with a valid SP
+ *
+ * Runs whichever tests are enabled by TEST_MASK (bit N-1 = Test N).
+ * Each test function is self-contained: test_begin() ensures clean state
+ * regardless of what ran before.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void isr_main(void)
+{
     put_str("\r\n");
     put_str("================================================\r\n");
-    put_str("  USART2 ISR Interrupt Test (GICv2)\r\n");
+    put_str("  USART2 ISR Interrupt Test (GICv3)\r\n");
     put_str("  A <-> B bridged via SerialBridge\r\n");
     put_str("  Interrupts via AArch64 EL1 exception vectors\r\n");
+    put_str("  TEST_MASK="); put_hex(TEST_MASK); put_str("\r\n");
     put_str("================================================\r\n\r\n");
 
     /* Install exception vectors, configure GIC, enable IRQs at EL1. */
@@ -292,221 +553,12 @@ static void isr_main(void)
     setup_gic();
     enable_irq();
 
-    /* ════════════════════════════════════════════════════════════════════════
-     * Test 1: A → B  (0x55)
-     * Expected: TBIR_A fires (USART_A INT), then RIR_B fires (USART_B INT).
-     * TIR_A may also appear if advance() completes the TX frame in one call.
-     * ════════════════════════════════════════════════════════════════════════ */
-    put_str("Test 1: A sends 0x55, expect TBIR_A + RIR_B\r\n");
-    {
-        unsigned int data;
-        base = g_log_count;
-        UA_TBUF = 0x55u;
+    if (TEST_MASK & 0x01u) { put_str("\r\n"); test1(); }
+    if (TEST_MASK & 0x02u) { put_str("\r\n"); test2(); }
+    if (TEST_MASK & 0x04u) { put_str("\r\n"); test3(); }
+    if (TEST_MASK & 0x08u) { put_str("\r\n"); test4(); }
+    if (TEST_MASK & 0x10u) { put_str("\r\n"); test5(); }
 
-        /* Wait for at least one event from each USART (min 2 total). */
-        if (!wait_n(base + 2u)) {
-            fail_test("T1", "IRQ timeout"); goto t2;
-        }
-        if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
-            fail_test("T1-TBIR_A", "not in ISR log"); goto t2;
-        }
-        put_str("  [ISR] TBIR_A confirmed\r\n");
-
-        if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
-            fail_test("T1-RIR_B", "not in ISR log"); goto t2;
-        }
-        put_str("  [ISR] RIR_B  confirmed\r\n");
-
-        data = UB_RBUF & 0xFFu;
-        put_str("  RBUF_B="); put_hex(data); put_str("\r\n");
-        if (data == 0x55u) pass_test("Test1 A->B 0x55");
-        else               fail_test("Test1", "RBUF_B != 0x55");
-    }
-
-t2:
-    /* ════════════════════════════════════════════════════════════════════════
-     * Test 2: B → A  (0xAA)
-     * ════════════════════════════════════════════════════════════════════════ */
-    put_str("\r\nTest 2: B sends 0xAA, expect TBIR_B + RIR_A\r\n");
-    {
-        unsigned int data;
-        base = g_log_count;
-        UB_TBUF = 0xAAu;
-
-        if (!wait_n(base + 2u)) {
-            fail_test("T2", "IRQ timeout"); goto t3;
-        }
-        if (find_event(base, IRQ_USART_B, STATUS_TBIR) < 0) {
-            fail_test("T2-TBIR_B", "not in ISR log"); goto t3;
-        }
-        put_str("  [ISR] TBIR_B confirmed\r\n");
-
-        if (find_event(base, IRQ_USART_A, STATUS_RIR) < 0) {
-            fail_test("T2-RIR_A", "not in ISR log"); goto t3;
-        }
-        put_str("  [ISR] RIR_A  confirmed\r\n");
-
-        data = UA_RBUF & 0xFFu;
-        put_str("  RBUF_A="); put_hex(data); put_str("\r\n");
-        if (data == 0xAAu) pass_test("Test2 B->A 0xAA");
-        else               fail_test("Test2", "RBUF_A != 0xAA");
-    }
-
-t3:
-    /* ════════════════════════════════════════════════════════════════════════
-     * Test 3: Overrun / EIR
-     *   Step 1: send 0x11 → fills RBUF_B (RIR_B fires)
-     *   Step 2: send 0x22 while RBUF_B still full → overrun → EIR_B fires
-     * ════════════════════════════════════════════════════════════════════════ */
-    put_str("\r\nTest 3: Overrun — EIR_B after second byte\r\n");
-    {
-        /* --- step 1: first byte fills RBUF_B -------------------------------- */
-        base = g_log_count;
-        UA_TBUF = 0x11u;
-
-        if (!wait_n(base + 1u)) {
-            fail_test("T3-RIR_B", "first byte timeout"); goto t4;
-        }
-        if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
-            fail_test("T3-RIR_B", "not in ISR log"); goto t4;
-        }
-        put_str("  [ISR] RIR_B (RBUF_B full)\r\n");
-
-        /* --- step 2: second byte → overrun --------------------------------- */
-        /* Do NOT drain RBUF_B — the overrun only fires if RBUF is still full. */
-        base = g_log_count;
-        UA_TBUF = 0x22u;
-
-        if (!wait_n(base + 1u)) {
-            fail_test("T3-EIR_B", "EIR timeout"); goto t4;
-        }
-        if (find_event(base, IRQ_USART_B, STATUS_EIR) < 0) {
-            fail_test("T3-EIR_B", "not in ISR log"); goto t4;
-        }
-        put_str("  [ISR] EIR_B  confirmed (overrun)\r\n");
-        pass_test("Test3 Overrun EIR");
-
-        /* Drain RBUF_B and clear all STATUS before next test. */
-        (void)UB_RBUF;
-        UA_STATUS = 0xFFFFFFFFu;
-        UB_STATUS = 0xFFFFFFFFu;
-    }
-
-t4:
-    /* ════════════════════════════════════════════════════════════════════════
-     * Test 4: Multi-byte stream A → B  [0xDE, 0xAD, 0xBE, 0xEF]
-     * Each TBUF write fires TBIR_A + RIR_B (and possibly TIR_A).
-     * ════════════════════════════════════════════════════════════════════════ */
-    put_str("\r\nTest 4: Multi-byte A->B [0xDE, 0xAD, 0xBE, 0xEF]\r\n");
-    {
-        static const unsigned int stream[4] = { 0xDEu, 0xADu, 0xBEu, 0xEFu };
-        int ok = 1;
-        unsigned int i;
-
-        for (i = 0u; i < 4u; ++i) {
-            unsigned int exp  = stream[i];
-            unsigned int data;
-
-            base = g_log_count;
-            UA_TBUF = exp;
-
-            if (!wait_n(base + 2u)) {
-                put_str("  timeout byte "); put_hex(exp); put_str("\r\n");
-                ok = 0; break;
-            }
-            if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
-                put_str("  TBIR_A missing for byte "); put_hex(exp); put_str("\r\n");
-                ok = 0; break;
-            }
-            if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
-                put_str("  RIR_B missing for byte "); put_hex(exp); put_str("\r\n");
-                ok = 0; break;
-            }
-
-            data = UB_RBUF & 0xFFu;
-            put_str("  [ISR] byte "); put_hex(i);
-            put_str(" sent="); put_hex(exp);
-            put_str(" got=");  put_hex(data);
-            put_str((data == exp) ? " OK\r\n" : " MISMATCH\r\n");
-            if (data != exp) ok = 0;
-        }
-        if (ok) pass_test("Test4 multi-byte");
-        else    fail_test("Test4 multi-byte", "mismatch or timeout");
-    }
-
-    /* ════════════════════════════════════════════════════════════════════════
-     * Test 5: TIR — TX-frame complete interrupt
-     *
-     * Because advance() is lazy (called only from b_transport), it may
-     * process many baud ticks in one call.  When Tests 1-4 have run before
-     * this point, a long gap exists between the last advance() and this
-     * TBUF write; advance() processes all those ticks at once, completing
-     * the TX frame and firing both TBIR and TIR in a single b_transport.
-     * The ISR therefore logs {TBIR} and {TIR} in the same call.
-     *
-     * If TIR is not already in the log after waiting for TBIR (which can
-     * happen if the elapsed time spans exactly one frame), the firmware
-     * reads UA_CON periodically to drive advance() forward until TIR fires
-     * and the edge-triggered GIC delivers a second IRQ.
-     * ════════════════════════════════════════════════════════════════════════ */
-    put_str("\r\nTest 5: TIR — TX-frame complete (ISR)\r\n");
-    {
-        unsigned int i;
-        int          tir_idx;
-
-        UA_STATUS = 0xFFFFFFFFu;
-        UB_STATUS = 0xFFFFFFFFu;
-        base = g_log_count;
-
-        UA_TBUF = 0x5Au;
-
-        /* Wait for at least TBIR_A */
-        if (!wait_n(base + 1u)) {
-            fail_test("T5-TBIR_A", "timeout"); goto done;
-        }
-        if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
-            fail_test("T5-TBIR_A", "not in ISR log"); goto done;
-        }
-        put_str("  [ISR] TBIR_A confirmed\r\n");
-
-        /* Check if TIR was already logged in the same (or a subsequent) ISR. */
-        tir_idx = find_event(base, IRQ_USART_A, STATUS_TIR);
-
-        if (tir_idx < 0) {
-            /* TIR not yet seen.  Drive advance() by reading UA_CON (any
-             * non-STATUS access goes through m_bus_fwd → advance()).
-             * TBIR de-asserts after 2 clock periods (~20 ns at 100 MHz),
-             * then TIR fires after the full baud frame (~3.2 µs at 100 MHz
-             * with BG=0 prescaler/2, 8N1).  The falling edge of irq_a after
-             * TBIR de-asserts, followed by the rising edge when TIR fires,
-             * gives the GIC a second edge trigger for IRQ 32.              */
-            for (i = 0u; i < 500u; ++i) {
-                volatile unsigned int dummy = UA_CON;  /* triggers advance() */
-                (void)dummy;
-                tir_idx = find_event(base, IRQ_USART_A, STATUS_TIR);
-                if (tir_idx >= 0) break;
-                /* A handful of NOPs advances simulation time a little between
-                 * each advance() call, helping separate TBIR de-assertion
-                 * from TIR assertion into distinct b_transport calls.       */
-                __asm__ volatile("nop\nnop\nnop\nnop\nnop" ::: "memory");
-            }
-        }
-
-        if (tir_idx >= 0) {
-            put_str("  [ISR] TIR_A  confirmed\r\n");
-            pass_test("Test5 TIR TX-complete");
-        } else {
-            put_str("  TIR not seen in ISR log after 500 advance() calls\r\n");
-            put_str("  STATUS_A="); put_hex(UA_STATUS); put_str("\r\n");
-            fail_test("Test5 TIR", "TIR never arrived");
-        }
-        UA_STATUS = 0xFFFFFFFFu;
-    }
-
-done:
-    /* ════════════════════════════════════════════════════════════════════════
-     * Summary
-     * ════════════════════════════════════════════════════════════════════════ */
     put_str("\r\n================================================\r\n");
     put_str("  Passed: "); put_hex((unsigned int)g_pass);
     put_str("   Failed: "); put_hex((unsigned int)g_fail);
@@ -514,7 +566,7 @@ done:
     put_str(g_fail == 0 ? "  ALL TESTS PASSED\r\n" : "  SOME TESTS FAILED\r\n");
     put_str("================================================\r\n");
 
-    while (1) { /* halt */ }
+    EXITER = 0u;   /* triggers sc_stop() — simulation ends cleanly */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -670,11 +722,17 @@ static void enable_irq(void)
  * out of the loop.  Because we are in multithread-unconstrained mode, QEMU
  * and SystemC run on separate OS threads; the ISR fires between QEMU
  * instructions and increments g_log_count without any scheduler cooperation.
+ *
+ * The iteration count of 40 is intentional.  irq_method() drives irq LOW
+ * then irq_pulse_method() drives it HIGH in the next delta cycle — a pulse
+ * that must be observed by the GIC before QEMU exits its current translated
+ * block.  A much larger spin holds the QEMU thread long enough that it
+ * executes through the pulse window and misses the GIC edge.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static int wait_n(unsigned int target)
 {
     unsigned int i;
-    for (i = 0u; i < 4000000u; ++i) {
+    for (i = 0u; i < 40u; ++i) {
         if (g_log_count >= target) return 1;
         __asm__ volatile("" ::: "memory");
     }
