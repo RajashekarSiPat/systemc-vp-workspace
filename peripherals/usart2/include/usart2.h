@@ -386,6 +386,30 @@ private:
             return;
         }
 
+        /* ── RBUF read: return data directly without calling advance() ─────
+         *
+         * Forwarding RBUF reads to m_bus_fwd triggers advance(sc_time_stamp())
+         * in the Usart core, which replays every baud-clock tick since the last
+         * advance() call.  After a test that let simulation time run (e.g. test 1
+         * whose sc_stop shows ~1.9 SC_SEC elapsed), this can mean 190 million
+         * 100 MHz ticks — seconds of wall-clock stall.
+         *
+         * get_rbuf_raw() / clear_rbuf() read and clear m_rbuf directly without
+         * calling advance(), matching exactly what m_bus_fwd would return once
+         * the core state is up to date.  rx_inject() already wrote the byte into
+         * m_rbuf and set m_rbuf_full when the byte arrived, so the value is
+         * always fresh.                                                          */
+        if (trans.get_command() == tlm::TLM_READ_COMMAND &&
+            offset == USART_RBUF_OFFSET)
+        {
+            uint32_t data = m_usart.get_rbuf_raw();
+            std::memcpy(trans.get_data_ptr(), &data, sizeof(data));
+            m_usart.clear_rbuf();
+            trans.set_dmi_allowed(false);
+            trans.set_response_status(tlm::TLM_OK_RESPONSE);
+            return;
+        }
+
         /* ── TBUF write: send byte to biflow backend ────────────────────── */
         if (trans.get_command() == tlm::TLM_WRITE_COMMAND &&
             offset == USART_TBUF_OFFSET)

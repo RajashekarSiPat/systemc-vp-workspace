@@ -46,9 +46,11 @@
  *   BSS region  g_vt[512] aligned to 2 KB — exception vector table
  */
 
-#ifndef TEST_MASK
-#define TEST_MASK 0x1Fu  /* run all five tests */
-#endif
+/* Test selection mask — placed at a fixed address (0x80FFFF00) so
+ * conf_isr.lua can patch it at run time via TEST_MASK env var.
+ * No recompile needed to select a different test combination.      */
+volatile unsigned int g_test_mask
+    __attribute__((section(".test_cfg"))) = 0x1Fu;
 
 /* ── MMIO helpers ─────────────────────────────────────────────────────────── */
 #define MMIO32(a)  (*(volatile unsigned int *)(unsigned long)(a))
@@ -539,7 +541,7 @@ static void isr_main(void)
     put_str("  USART2 ISR Interrupt Test (GICv3)\r\n");
     put_str("  A <-> B bridged via SerialBridge\r\n");
     put_str("  Interrupts via AArch64 EL1 exception vectors\r\n");
-    put_str("  TEST_MASK="); put_hex(TEST_MASK); put_str("\r\n");
+    put_str("  TEST_MASK="); put_hex(g_test_mask); put_str("\r\n");
     put_str("================================================\r\n\r\n");
 
     /* Install exception vectors, configure GIC, enable IRQs at EL1. */
@@ -553,11 +555,11 @@ static void isr_main(void)
     setup_gic();
     enable_irq();
 
-    if (TEST_MASK & 0x01u) { put_str("\r\n"); test1(); }
-    if (TEST_MASK & 0x02u) { put_str("\r\n"); test2(); }
-    if (TEST_MASK & 0x04u) { put_str("\r\n"); test3(); }
-    if (TEST_MASK & 0x08u) { put_str("\r\n"); test4(); }
-    if (TEST_MASK & 0x10u) { put_str("\r\n"); test5(); }
+    if (g_test_mask & 0x01u) { put_str("\r\n"); test1(); }
+    if (g_test_mask & 0x02u) { put_str("\r\n"); test2(); }
+    if (g_test_mask & 0x04u) { put_str("\r\n"); test3(); }
+    if (g_test_mask & 0x08u) { put_str("\r\n"); test4(); }
+    if (g_test_mask & 0x10u) { put_str("\r\n"); test5(); }
 
     put_str("\r\n================================================\r\n");
     put_str("  Passed: "); put_hex((unsigned int)g_pass);
@@ -723,18 +725,21 @@ static void enable_irq(void)
  * and SystemC run on separate OS threads; the ISR fires between QEMU
  * instructions and increments g_log_count without any scheduler cooperation.
  *
- * The iteration count of 40 is intentional.  irq_method() drives irq LOW
- * then irq_pulse_method() drives it HIGH in the next delta cycle — a pulse
- * that must be observed by the GIC before QEMU exits its current translated
- * block.  A much larger spin holds the QEMU thread long enough that it
- * executes through the pulse window and misses the GIC edge.
+ * Each iteration executes WFI (Wait For Interrupt) so the vCPU idles until
+ * the GIC delivers the next IRQ, at which point the ISR runs and increments
+ * g_log_count before returning here.  This is reliable regardless of timing:
+ * the CPU genuinely sleeps until the interrupt arrives rather than racing a
+ * tight spin against the SystemC IRQ-delivery pipeline.
+ *
+ * The limit of 40 WFI iterations is a generous timeout (40 distinct interrupt
+ * events) — in practice tests need only 1-2 events each.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static int wait_n(unsigned int target)
 {
     unsigned int i;
     for (i = 0u; i < 40u; ++i) {
         if (g_log_count >= target) return 1;
-        __asm__ volatile("" ::: "memory");
+        __asm__ volatile("wfi" ::: "memory");
     }
     return 0;
 }

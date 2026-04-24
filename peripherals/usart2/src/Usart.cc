@@ -448,10 +448,19 @@ void Usart::advance(sc_time now)
             m_baud_tick.notify(SC_ZERO_TIME);
             stepTx();
             stepRx();
+            // Once TX and RX are both fully idle (no frame in progress, no
+            // pending data), every remaining tick does nothing.  Break early
+            // so a TBUF write after a long idle gap (e.g. across several
+            // SC_SEC of WFI-based waiting) does not burn millions of ticks.
+            // The time base is still advanced by the full n_ticks below.
+            if (!m_tsr_busy && !m_tbuf_full &&
+                m_tx_state == TxState::IDLE && m_rx_state == RxState::IDLE)
+                break;
         }
     }
 
-    // Update timestamp to the integral number of ticks we actually processed.
+    // Update timestamp by the full n_ticks.  Idle ticks skipped by the early
+    // exit above produced no state changes, so skipping them is correct.
     m_last_advance_time += m_clk_period * static_cast<double>(n_ticks);
 
     // De-assert any IRQ outputs whose 2-cycle pulse has expired.

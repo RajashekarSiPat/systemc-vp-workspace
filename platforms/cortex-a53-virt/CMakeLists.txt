@@ -69,38 +69,23 @@ if(AARCH64_GCC)
     )
     add_custom_target(cortex-a53-virt-fw3 ALL DEPENDS ${FW3_ELF})
 
-    # ---- hello_isr.elf — ISR GICv3 USART2 interrupt test (all tests) ---------
+    # ---- hello_isr.elf — ISR GICv3 USART2 interrupt test ----------------------
+    # Test selection is done at run time via TEST_MASK env var (read by Lua).
+    # g_test_mask lives at 0x80FFFF00 (--section-start); Lua patches it before
+    # the CPU starts.  No per-test ELFs needed.
     set(FW4_SRC "${CMAKE_SOURCE_DIR}/baremetal/cortex-a53/src/hello_isr.c")
     set(FW4_ELF "${CMAKE_CURRENT_SOURCE_DIR}/hello_isr.elf")
     set(FW4_FLAGS -nostdlib -static -Ttext=0x80000000 -e _start
-                  -Wl,--build-id=none -Wl,-n)
+                  -Wl,--build-id=none -Wl,-n
+                  "-Wl,--section-start=.test_cfg=0x80FFFF00")
 
     add_custom_command(
         OUTPUT  ${FW4_ELF}
         COMMAND ${AARCH64_GCC} ${FW4_FLAGS} -o ${FW4_ELF} ${FW4_SRC}
         DEPENDS ${FW4_SRC}
-        COMMENT "Cross-compiling hello_isr.elf (all tests, TEST_MASK=0x1F)"
+        COMMENT "Cross-compiling hello_isr.elf (runtime TEST_MASK via Lua)"
     )
     add_custom_target(cortex-a53-virt-fw-isr ALL DEPENDS ${FW4_ELF})
-
-    # ---- hello_isr_tN.elf — one ELF per test (TEST_MASK selects one test) ---
-    set(_isr_nums  1    2    3    4    5   )
-    set(_isr_masks 0x01 0x02 0x04 0x08 0x10)
-    list(LENGTH _isr_nums _isr_count)
-    math(EXPR _isr_last "${_isr_count} - 1")
-    foreach(_i RANGE ${_isr_last})
-        list(GET _isr_nums  ${_i} _n)
-        list(GET _isr_masks ${_i} _mask)
-        set(_elf "${CMAKE_CURRENT_SOURCE_DIR}/hello_isr_t${_n}.elf")
-        add_custom_command(
-            OUTPUT  ${_elf}
-            COMMAND ${AARCH64_GCC} ${FW4_FLAGS}
-                    -DTEST_MASK=${_mask} -o ${_elf} ${FW4_SRC}
-            DEPENDS ${FW4_SRC}
-            COMMENT "Cross-compiling hello_isr_t${_n}.elf (TEST_MASK=${_mask})"
-        )
-        add_custom_target(cortex-a53-virt-fw-isr-t${_n} ALL DEPENDS ${_elf})
-    endforeach()
 
 else()
     message(WARNING

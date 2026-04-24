@@ -30,6 +30,27 @@ function script_path()
 end
 local base = script_path()
 
+-- TEST_MASK selects which tests to run (bit N-1 = Test N; default 0x1F = all).
+-- The loader patches g_test_mask at 0x80FFFF00 after loading the ELF, so no
+-- recompile is needed:
+--   TEST_MASK=0x01 ./vp ...   -- only Test 1
+--   TEST_MASK=0x07 ./vp ...   -- Tests 1, 2, 3
+local test_mask = tonumber(os.getenv("TEST_MASK")) or 0x1F
+
+-- Write test_mask as a little-endian uint32 binary file so the loader can
+-- patch g_test_mask at 0x80FFFF00 via bin_file (unambiguous path; the data={}
+-- loader path requires CCI integer-key support that is not always available).
+local mask_file = "/tmp/hello_isr_mask.bin"
+do
+    local b0 = test_mask % 256
+    local b1 = math.floor(test_mask / 256) % 256
+    local b2 = math.floor(test_mask / 65536) % 256
+    local b3 = math.floor(test_mask / 16777216) % 256
+    local f   = assert(io.open(mask_file, "wb"))
+    f:write(string.char(b0, b1, b2, b3))
+    f:close()
+end
+
 platform = {
     moduletype = "Container",
     quantum_ns = 10000000,
@@ -170,13 +191,18 @@ platform = {
     },
 
     -- -----------------------------------------------------------------------
-    -- ELF loader
-    -- Override the firmware with ISR_ELF env var to run a single test:
-    --   ISR_ELF=.../hello_isr_t3.elf ./cortex-a53-virt-vp --gs_luafile conf_isr.lua
+    -- ELF loader + runtime test-mask patch
+    --
+    -- Entry 1: load the firmware ELF (ISR_ELF env var overrides the default).
+    -- Entry 2: write test_mask (a uint32) to g_test_mask at 0x80FFFF00.
+    --          This overwrites the ELF's default 0x1F with the value from
+    --          the TEST_MASK env var (or 0x1F if unset), so the CPU sees the
+    --          right mask before it reaches isr_main().
     -- -----------------------------------------------------------------------
     load = {
         moduletype       = "loader",
         initiator_socket = { bind = "&router.target_socket" },
         { elf_file = os.getenv("ISR_ELF") or (base .. "hello_isr.elf") },
+        { address = 0x80FFFF00, bin_file = mask_file },
     },
 }

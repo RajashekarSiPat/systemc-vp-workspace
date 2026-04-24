@@ -175,6 +175,15 @@ SC_MODULE(Usart)
     bool is_rir_asserted()  const { return m_rir_assert_time  != sc_core::SC_ZERO_TIME; }
     bool is_eir_asserted()  const { return m_eir_assert_time  != sc_core::SC_ZERO_TIME; }
 
+    // =========================================================================
+    // Direct RBUF accessors — do NOT call advance(), safe from any thread.
+    // Used by Usart2::b_transport to serve RBUF reads without triggering the
+    // lazy-advance engine (which replays all elapsed baud ticks and is slow
+    // when called after a long simulation-time gap between b_transport calls).
+    // =========================================================================
+    uint32_t get_rbuf_raw()  const { return m_rbuf.raw; }
+    void     clear_rbuf()          { m_rbuf_full = false; m_rbuf.raw = 0u; }
+
 private:
     // =========================================================================
     // Register bank
