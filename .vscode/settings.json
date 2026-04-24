@@ -1,17 +1,4 @@
 {
-    // ── C++ / clangd ──────────────────────────────────────────────────────────
-    // Use clangd instead of the default IntelliSense engine.
-    // clangd reads compile_commands.json so it resolves all QBOX headers.
-    "clangd.arguments": [
-        "--compile-commands-dir=${workspaceFolder}/build",
-        "--background-index",
-        "--clang-tidy",
-        "--header-insertion=never",
-        "--completion-style=detailed",
-        "--log=error"
-    ],
-    "C_Cpp.intelliSenseEngine": "disabled",
-
     // ── CMake Tools ───────────────────────────────────────────────────────────
     "cmake.buildDirectory": "${workspaceFolder}/build",
     "cmake.sourceDirectory": "${workspaceFolder}",
@@ -26,7 +13,6 @@
     "editor.tabSize": 4,
     "editor.insertSpaces": true,
     "files.trimTrailingWhitespace": true,
-    "editor.lineNumbers": "relative",
 
     // ── Vim (vscodevim) ───────────────────────────────────────────────────────
     "vim.enable": true,

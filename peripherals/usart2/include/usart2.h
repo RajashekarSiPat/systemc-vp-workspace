@@ -104,7 +104,7 @@ public:
         , m_status(0u)
         , m_tbuf_write_count(0u)
         , m_tbir_fired_count(0u)
-        , m_irq_tir_prev(false)
+        , m_tir_fired_count(0u)
         , m_rx_accept_count(0u)
         , m_rir_fired_count(0u)
         , m_rx_overrun_count(0u)
@@ -250,7 +250,7 @@ private:
      * will not fire; Test 5 is expected to fail in that scenario.          */
     unsigned int m_tbuf_write_count;   /* incremented per TBUF write in b_transport  */
     unsigned int m_tbir_fired_count;   /* matched to m_tbuf_write_count when TBIR set */
-    bool         m_irq_tir_prev;       /* for TIR rising-edge detection (prev-based)  */
+    unsigned int m_tir_fired_count;    /* matched to get_tir_fire_count() when TIR set */
     unsigned int m_rx_accept_count;    /* incremented per successful rx_inject call   */
     unsigned int m_rir_fired_count;    /* matched to m_rx_accept_count when RIR set   */
     unsigned int m_rx_overrun_count;   /* incremented per failed rx_inject (overrun)  */
@@ -301,18 +301,27 @@ private:
         }
 
         /* ── TIR ──────────────────────────────────────────────────────────────
-         * TX-frame complete — fires from stepTx() via advance().  In
-         * same-quantum mode advance() returns early so TIR never fires here;
-         * Test 5 is expected to fail in that scenario.  Prev-based detection
-         * is correct when advance does run (e.g., after a quantum boundary).  */
-        bool tir = m_usart.is_tir_asserted();
-        if (tir && !m_irq_tir_prev) {
-            m_status |= STATUS_TIR;
-            new_irq = true;
-            SCP_INFO(()) << "TIR  fired at " << sc_core::sc_time_stamp()
-                         << "  (TX frame complete)";
+         * TX-frame complete — fires from stepTx() via advance().
+         *
+         * Prev-based detection (is_tir_asserted()) cannot be used here because
+         * updateIrqPulses() runs at the end of advance() BEFORE this function
+         * is called.  When the elapsed simulation time is large (e.g. 10 ms
+         * after a WFI gap), updateIrqPulses sees (now - assert_time) >> 2 clk
+         * and immediately de-asserts TIR, so is_tir_asserted() always returns
+         * false by the time we check it.
+         *
+         * m_tir_fire_count is incremented by stepTx() at the exact moment TIR
+         * is asserted and is never touched by updateIrqPulses(), so it reliably
+         * survives the pulse-expiry window.                                     */
+        {
+            unsigned int tir_count = m_usart.get_tir_fire_count();
+            if (tir_count > m_tir_fired_count) {
+                m_status |= STATUS_TIR;
+                m_tir_fired_count = tir_count;
+                new_irq = true;
+                SCP_INFO(()) << "TIR  fired (tir_fire_count=" << tir_count << ")";
+            }
         }
-        m_irq_tir_prev = tir;
 
         /* ── RIR ──────────────────────────────────────────────────────────────
          * Fire once per successful rx_inject.  Same-quantum issue as TBIR:

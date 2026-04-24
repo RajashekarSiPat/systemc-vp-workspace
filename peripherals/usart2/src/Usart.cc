@@ -133,6 +133,7 @@ Usart::Usart(sc_module_name nm)
     , m_tir_assert_time(SC_ZERO_TIME)
     , m_rir_assert_time(SC_ZERO_TIME)
     , m_eir_assert_time(SC_ZERO_TIME)
+    , m_tir_fire_count(0u)
 {
     DBG_FN(1);
 
@@ -354,6 +355,7 @@ void Usart::rstMethod()
     m_tir_assert_time  = SC_ZERO_TIME;
     m_rir_assert_time  = SC_ZERO_TIME;
     m_eir_assert_time  = SC_ZERO_TIME;
+    m_tir_fire_count   = 0u;
 
     // Outputs
     USART_TxRx_Tlm mark;
@@ -614,8 +616,10 @@ void Usart::stepTx()
             if (usart_mode_has_hw_parity(mode)) {
                 m_tx_state = TxState::PARITY;
             } else {
-                if (nstop == 1u)
+                if (nstop == 1u) {
                     assertIrq(m_tir_assert_time, tir, "tir"); // last stop = STOP1
+                    ++m_tir_fire_count;
+                }
                 m_tx_state = TxState::STOP1;
             }
         }
@@ -626,8 +630,10 @@ void Usart::stepTx()
         drivePin(m_tsr_parity ? 1u : 0u, false, 0u, m_tsr_parity);
         DBG(3, "TX PARITY=" << m_tsr_parity);
         uint8_t nstop = usart_stop_bits(mode, m_con.fields.STP);
-        if (nstop == 1u)
+        if (nstop == 1u) {
             assertIrq(m_tir_assert_time, tir, "tir"); // last stop = STOP1
+            ++m_tir_fire_count;
+        }
         m_tx_state = TxState::STOP1;
         break;
     }
@@ -638,6 +644,7 @@ void Usart::stepTx()
         DBG(3, "TX STOP1 nstop=" << +nstop);
         if (nstop >= 2u) {
             assertIrq(m_tir_assert_time, tir, "tir"); // last stop = STOP2
+            ++m_tir_fire_count;
             m_tx_state = TxState::STOP2;
         } else {
             m_tsr_busy = false;

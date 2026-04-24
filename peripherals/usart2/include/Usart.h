@@ -175,6 +175,12 @@ SC_MODULE(Usart)
     bool is_rir_asserted()  const { return m_rir_assert_time  != sc_core::SC_ZERO_TIME; }
     bool is_eir_asserted()  const { return m_eir_assert_time  != sc_core::SC_ZERO_TIME; }
 
+    // Monotone counter incremented each time stepTx() asserts TIR.
+    // Unlike m_tir_assert_time, this is never cleared by updateIrqPulses(),
+    // so Usart2 can reliably detect TIR even when the 2-cycle pulse has expired
+    // before update_status_from_core() gets to run.
+    unsigned int get_tir_fire_count() const { return m_tir_fire_count; }
+
     // =========================================================================
     // Direct RBUF accessors — do NOT call advance(), safe from any thread.
     // Used by Usart2::b_transport to serve RBUF reads without triggering the
@@ -274,6 +280,7 @@ private:
     sc_core::sc_time m_tir_assert_time;
     sc_core::sc_time m_rir_assert_time;
     sc_core::sc_time m_eir_assert_time;
+    unsigned int     m_tir_fire_count;  ///< incremented by stepTx on every TIR assert
 
     // =========================================================================
     // Internal event — posted at SC_ZERO_TIME on each BG underflow
