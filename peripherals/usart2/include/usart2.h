@@ -109,6 +109,12 @@ public:
         , m_rir_fired_count(0u)
         , m_rx_overrun_count(0u)
         , m_eir_fired_count(0u)
+        , m_sig_txd_line("sig_txd_line")
+        , m_sig_rxd_line("sig_rxd_line")
+        , m_sig_irq_out("sig_irq_out")
+        , m_vcd_file("vcd_file", "",
+                     "VCD output file basename; empty = disabled")
+        , m_tf(nullptr)
     {
         SCP_TRACE(()) << "Usart2 constructor";
 
@@ -150,6 +156,17 @@ public:
         SC_METHOD(irq_deassert_method);
         sensitive << m_sig_tbir << m_sig_tir << m_sig_rir << m_sig_eir;
         dont_initialize();
+
+        /* txd/rxd line-level extraction: each baud bit drives m_sig_txd /
+         * m_sig_rxd with a USART_TxRx_Tlm struct; extract the physical line
+         * level (data bit 0) into bool signals for VCD tracing.             */
+        SC_METHOD(txd_line_method);
+        sensitive << m_sig_txd;
+        dont_initialize();
+
+        SC_METHOD(rxd_line_method);
+        sensitive << m_sig_rxd;
+        dont_initialize();
     }
 
     void start_of_simulation() override
@@ -176,6 +193,35 @@ public:
         } else {
             SCP_WARN(()) << "clk_hz is 0 — Usart core clock not configured";
         }
+
+        std::string vcd = m_vcd_file.get_value();
+        if (!vcd.empty()) {
+            m_tf = sc_core::sc_create_vcd_trace_file(vcd.c_str());
+            if (m_tf) {
+                /* Seed idle levels before the trace file records t=0. */
+                m_sig_txd_line.write(true);
+                m_sig_rxd_line.write(true);
+                sc_core::sc_trace(m_tf, m_sig_txd_line,
+                                  std::string(name()) + ".txd");
+                sc_core::sc_trace(m_tf, m_sig_rxd_line,
+                                  std::string(name()) + ".rxd");
+                sc_core::sc_trace(m_tf, m_sig_tbir,
+                                  std::string(name()) + ".tbir");
+                sc_core::sc_trace(m_tf, m_sig_tir,
+                                  std::string(name()) + ".tir");
+                sc_core::sc_trace(m_tf, m_sig_rir,
+                                  std::string(name()) + ".rir");
+                sc_core::sc_trace(m_tf, m_sig_eir,
+                                  std::string(name()) + ".eir");
+                sc_core::sc_trace(m_tf, m_sig_irq_out,
+                                  std::string(name()) + ".irq");
+            }
+        }
+    }
+
+    void end_of_simulation() override
+    {
+        if (m_tf) sc_core::sc_close_vcd_trace_file(m_tf);
     }
 
 private:
@@ -514,6 +560,7 @@ private:
     void irq_method()
     {
         if (irq.size() > 0) irq->write(false);
+        m_sig_irq_out.write(false);
         m_irq_state = false;
         m_irq_pulse_event.notify(sc_core::SC_ZERO_TIME);
     }
@@ -526,6 +573,7 @@ private:
     {
         m_irq_state = true;
         if (irq.size() > 0) irq->write(true);
+        m_sig_irq_out.write(true);
     }
 
     /* ── irq_deassert_method ─────────────────────────────────────────────
@@ -547,8 +595,37 @@ private:
         if (!asserted && m_irq_state) {
             m_irq_state = false;
             if (irq.size() > 0) irq->write(false);
+            m_sig_irq_out.write(false);
         }
     }
+    /* ── txd_line_method / rxd_line_method ──────────────────────────────────
+     * The Usart core drives m_sig_txd with USART_TxRx_Tlm structs (one per
+     * baud bit: START, DATA bits, optional PARITY, STOP).  The physical line
+     * level is always the LSB of the `data` field:
+     *   START bit : data=0, startOrStop=true → line LOW
+     *   STOP  bit : data=1, startOrStop=true → line HIGH
+     *   Data  bit : data = bit value           → line HIGH or LOW
+     *   Idle      : data=1 (mark)              → line HIGH
+     * rxd stays at idle (mark) in the SerialBridge architecture because bytes
+     * arrive via rx_inject() directly into RBUF, not through the serial pin.
+     * ──────────────────────────────────────────────────────────────────── */
+    void txd_line_method()
+    {
+        m_sig_txd_line.write((m_sig_txd.read().data & 1u) != 0u);
+    }
+
+    void rxd_line_method()
+    {
+        m_sig_rxd_line.write((m_sig_rxd.read().data & 1u) != 0u);
+    }
+
+    /* ── VCD trace signals and file ─────────────────────────────────────── */
+    sc_core::sc_signal<bool>    m_sig_txd_line; ///< physical TXD line level
+    sc_core::sc_signal<bool>    m_sig_rxd_line; ///< physical RXD line level
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_irq_out; ///< mirror of irq output
+
+    cci::cci_param<std::string> m_vcd_file;     ///< basename; empty = disabled
+    sc_core::sc_trace_file*     m_tf;           ///< null when not tracing
 };
 
 extern "C" void module_register();
