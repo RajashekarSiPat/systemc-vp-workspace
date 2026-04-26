@@ -47,8 +47,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <queue>
 #include <unistd.h>   /* write() for async-signal-safe tracing */
 #include <systemc>
 #include "tlm.h"
@@ -58,6 +61,7 @@
 
 #include <ports/initiator-signal-socket.h>
 #include <ports/biflow-socket.h>
+#include <async_event.h>
 #include <module_factory_registery.h>
 #include <scp/report.h>
 #include <tlm_sockets_buswidth.h>
@@ -99,7 +103,6 @@ public:
         , m_bus_fwd("bus_fwd")
         , m_clk_hz("clk_hz", 100000000ULL,
                    "Peripheral clock frequency in Hz (default 100 MHz)")
-        , m_sig_irq_seq("sig_irq_seq")
         , m_irq_state(false)
         , m_status(0u)
         , m_tbuf_write_count(0u)
@@ -112,6 +115,16 @@ public:
         , m_sig_txd_line("sig_txd_line")
         , m_sig_rxd_line("sig_rxd_line")
         , m_sig_irq_out("sig_irq_out")
+        , m_trace_tbir("trace_tbir")
+        , m_trace_tir("trace_tir")
+        , m_trace_rir("trace_rir")
+        , m_trace_eir("trace_eir")
+        , m_trace_irq("trace_irq")
+        , m_sig_txd_wave("sig_txd_wave")
+        , m_sig_rxd_wave("sig_rxd_wave")
+        , m_txd_wave_cnt(0u)
+        , m_rxd_wave_cnt(0u)
+        , m_pending_trace_irqs(0u)
         , m_vcd_file("vcd_file", "",
                      "VCD output file basename; empty = disabled")
         , m_tf(nullptr)
@@ -133,14 +146,17 @@ public:
         backend_socket.register_b_transport(this, &Usart2::rx_receive);
         /* do NOT call can_receive_set() here — sockets not yet bound */
 
-        /* irq_method: fires when a new IRQ event is detected (m_sig_irq_seq
-         * incremented by update_status_from_core).  Generates the first half
-         * of the GIC LOW→HIGH pulse: drives LOW, then schedules irq_pulse_method
-         * via m_irq_pulse_event to drive HIGH in the next delta cycle.
-         * The counter ensures a genuine signal value-change on every new event,
-         * avoiding the false/true coalescing issue of sc_signal<bool>.        */
+        /* irq_method: fires when m_irq_event is notified by update_status_from_core.
+         * m_irq_event is a gs::async_event with async_attach_suspending() active,
+         * which keeps SystemC's m_has_suspending_channels=true.  This ensures the
+         * SC kernel's async_suspend() blocks on the semaphore rather than returning
+         * immediately, so QEMU's async_request_update() always wakes SC before the
+         * simulation is declared deadlocked.  Without this, can_receive_any() leaves
+         * all biflow sockets detached, SC sees no suspending channels, and the
+         * suspend() call returns instantly — creating a race where SC terminates
+         * before processing the pending IRQ notification.                        */
         SC_METHOD(irq_method);
-        sensitive << m_sig_irq_seq;
+        sensitive << m_irq_event;
         dont_initialize();
 
         /* irq_pulse_method: second half of the GIC pulse — drives HIGH.       */
@@ -157,16 +173,36 @@ public:
         sensitive << m_sig_tbir << m_sig_tir << m_sig_rir << m_sig_eir;
         dont_initialize();
 
-        /* txd/rxd line-level extraction: each baud bit drives m_sig_txd /
-         * m_sig_rxd with a USART_TxRx_Tlm struct; extract the physical line
-         * level (data bit 0) into bool signals for VCD tracing.             */
-        SC_METHOD(txd_line_method);
-        sensitive << m_sig_txd;
+        /* txd_enqueue_method: woken by m_sig_txd_wave (written from QEMU thread
+         * via SC_MANY_WRITERS async path) when a TBUF byte is queued.  Starts
+         * the txd bit-state-machine if it is idle.                          */
+        SC_METHOD(txd_enqueue_method);
+        sensitive << m_sig_txd_wave;
         dont_initialize();
 
-        SC_METHOD(rxd_line_method);
-        sensitive << m_sig_rxd;
+        /* txd_wave_method: bit-level state machine for TXD waveform + TIR pulse.
+         * States: 0=START, 1-8=DATA bits, 9=STOP, 10=TIR_assert, 11=TIR_deassert.
+         * Each state drives m_sig_txd_line and schedules the next state via
+         * m_txd_wave_ev.notify(baud_period).  No next_trigger(), no SC_THREAD. */
+        SC_METHOD(txd_wave_method);
+        sensitive << m_txd_wave_ev;
         dont_initialize();
+
+        /* rxd_enqueue_method / rxd_wave_method: same pattern for the RX pin.  */
+        SC_METHOD(rxd_enqueue_method);
+        sensitive << m_sig_rxd_wave;
+        dont_initialize();
+
+        SC_METHOD(rxd_wave_method);
+        sensitive << m_rxd_wave_ev;
+        dont_initialize();
+
+        /* Expire SC_METHODs: deassert trace pulse signals after 2 clk periods.
+         * Notified by irq_method (tbir/rir/eir) and irq_pulse_method (irq). */
+        SC_METHOD(tbir_expire_method); sensitive << m_tbir_expire_ev; dont_initialize();
+        SC_METHOD(rir_expire_method);  sensitive << m_rir_expire_ev;  dont_initialize();
+        SC_METHOD(eir_expire_method);  sensitive << m_eir_expire_ev;  dont_initialize();
+        SC_METHOD(irq_expire_method);  sensitive << m_irq_expire_ev;  dont_initialize();
     }
 
     void start_of_simulation() override
@@ -198,23 +234,17 @@ public:
         if (!vcd.empty()) {
             m_tf = sc_core::sc_create_vcd_trace_file(vcd.c_str());
             if (m_tf) {
-                /* Seed idle levels before the trace file records t=0. */
+                /* Seed idle high levels before trace file records t=0. */
                 m_sig_txd_line.write(true);
                 m_sig_rxd_line.write(true);
-                sc_core::sc_trace(m_tf, m_sig_txd_line,
-                                  std::string(name()) + ".txd");
-                sc_core::sc_trace(m_tf, m_sig_rxd_line,
-                                  std::string(name()) + ".rxd");
-                sc_core::sc_trace(m_tf, m_sig_tbir,
-                                  std::string(name()) + ".tbir");
-                sc_core::sc_trace(m_tf, m_sig_tir,
-                                  std::string(name()) + ".tir");
-                sc_core::sc_trace(m_tf, m_sig_rir,
-                                  std::string(name()) + ".rir");
-                sc_core::sc_trace(m_tf, m_sig_eir,
-                                  std::string(name()) + ".eir");
-                sc_core::sc_trace(m_tf, m_sig_irq_out,
-                                  std::string(name()) + ".irq");
+                std::string n = name();
+                sc_core::sc_trace(m_tf, m_sig_txd_line, n + ".txd");
+                sc_core::sc_trace(m_tf, m_sig_rxd_line, n + ".rxd");
+                sc_core::sc_trace(m_tf, m_trace_tbir,   n + ".tbir");
+                sc_core::sc_trace(m_tf, m_trace_tir,    n + ".tir");
+                sc_core::sc_trace(m_tf, m_trace_rir,    n + ".rir");
+                sc_core::sc_trace(m_tf, m_trace_eir,    n + ".eir");
+                sc_core::sc_trace(m_tf, m_trace_irq,    n + ".irq");
             }
         }
     }
@@ -256,22 +286,15 @@ private:
     /* ── CCI parameters ─────────────────────────────────────────────────── */
     cci::cci_param<uint64_t> m_clk_hz;
 
-    /* ── GIC pulse sequencer ────────────────────────────────────────────── */
-    /* m_sig_irq_seq is written by update_status_from_core() (QEMU thread) each
-     * time a new IRQ event is detected.  It is monotonically increasing so every
-     * write produces a genuine signal value-change, which reliably triggers
-     * irq_method() in the SystemC thread regardless of whether the previous
-     * pulse's deassert and the new pulse's assert coalesced in the async queue.
-     *
-     * Using sc_signal<bool> for GIC edge generation was broken because:
-     *   advance()  writes  m_sig_tbir.write(false)  (deassert old pulse)
-     *   loadTSR()  writes  m_sig_tbir.write(true)   (assert new pulse)
-     * Both happen in the same b_transport call from QEMU's thread.  SystemC's
-     * async_request_update() batches them: last write wins (true), the pending
-     * value equals the current value (true), so NO value-change event fires and
-     * irq_method() never runs.  The sequence-number signal avoids this by always
-     * changing value on a new IRQ event.                                      */
-    sc_core::sc_signal<unsigned int, sc_core::SC_MANY_WRITERS> m_sig_irq_seq;
+    /* ── GIC IRQ async wakeup event ─────────────────────────────────────── */
+    /* m_irq_event uses gs::async_event (start_attached=true by default) so that
+     * async_attach_suspending() is called during construction, keeping
+     * m_has_suspending_channels=true for the lifetime of simulation.  This
+     * ensures the SC kernel's async_suspend() blocks on its semaphore rather
+     * than returning immediately; QEMU's async_request_update() (posted from
+     * update_status_from_core via any thread) unblocks SC reliably, eliminating
+     * the race where SC terminates before processing the pending IRQ update. */
+    gs::async_event m_irq_event;
 
     /* ── GIC IRQ output state ───────────────────────────────────────────── */
     bool m_irq_state;
@@ -343,6 +366,7 @@ private:
             m_status |= STATUS_TBIR;
             m_tbir_fired_count = m_tbuf_write_count;
             new_irq = true;
+            m_pending_trace_irqs.fetch_or(STATUS_TBIR, std::memory_order_relaxed);
             SCP_INFO(()) << "TBIR fired (tbuf_write_count=" << m_tbuf_write_count << ")";
         }
 
@@ -377,6 +401,7 @@ private:
             m_status |= STATUS_RIR;
             m_rir_fired_count = m_rx_accept_count;
             new_irq = true;
+            m_pending_trace_irqs.fetch_or(STATUS_RIR, std::memory_order_relaxed);
             SCP_INFO(()) << "RIR  fired (rx_accept_count=" << m_rx_accept_count << ")";
         }
 
@@ -386,11 +411,13 @@ private:
             m_status |= STATUS_EIR;
             m_eir_fired_count = m_rx_overrun_count;
             new_irq = true;
+            m_pending_trace_irqs.fetch_or(STATUS_EIR, std::memory_order_relaxed);
             SCP_INFO(()) << "EIR  fired (rx_overrun_count=" << m_rx_overrun_count << ")";
         }
 
-        if (new_irq)
-            m_sig_irq_seq.write(m_sig_irq_seq.read() + 1u);
+        if (new_irq) {
+            m_irq_event.notify(sc_core::SC_ZERO_TIME);
+        }
     }
 
     /* ── b_transport ─────────────────────────────────────────────────────
@@ -508,6 +535,13 @@ private:
             /* Count this write so update_status_from_core() fires exactly one
              * TBIR per TBUF write, independent of whether advance() has run. */
             ++m_tbuf_write_count;
+            if (m_tf) {
+                {
+                    std::lock_guard<std::mutex> lk(m_txd_wave_mtx);
+                    m_txd_wave_queue.push(static_cast<uint8_t>(val & 0xFFu));
+                }
+                m_sig_txd_wave.write(++m_txd_wave_cnt);
+            }
             }
         }
 
@@ -534,6 +568,13 @@ private:
             if (m_usart.rx_inject(ptr[i])) {
                 /* Accepted: byte stored in RBUF, RIR asserted by core. */
                 ++m_rx_accept_count;
+                if (m_tf) {
+                    {
+                        std::lock_guard<std::mutex> lk(m_rxd_wave_mtx);
+                        m_rxd_wave_queue.push(ptr[i]);
+                    }
+                    m_sig_rxd_wave.write(++m_rxd_wave_cnt);
+                }
             } else {
                 /* Overrun: RBUF full, EIR asserted by core (if OEN=1). */
                 ++m_rx_overrun_count;
@@ -563,6 +604,26 @@ private:
         m_sig_irq_out.write(false);
         m_irq_state = false;
         m_irq_pulse_event.notify(sc_core::SC_ZERO_TIME);
+
+        if (m_tf) {
+            uint32_t mask = m_pending_trace_irqs.exchange(0u,
+                                std::memory_order_acquire);
+            sc_core::sc_time two_clk = 2u * m_sig_clk.read();
+            if (two_clk != sc_core::SC_ZERO_TIME) {
+                if (mask & STATUS_TBIR) {
+                    m_trace_tbir.write(true);
+                    m_tbir_expire_ev.notify(two_clk);
+                }
+                if (mask & STATUS_RIR) {
+                    m_trace_rir.write(true);
+                    m_rir_expire_ev.notify(two_clk);
+                }
+                if (mask & STATUS_EIR) {
+                    m_trace_eir.write(true);
+                    m_eir_expire_ev.notify(two_clk);
+                }
+            }
+        }
     }
 
     /* ── irq_pulse_method ────────────────────────────────────────────────
@@ -572,8 +633,16 @@ private:
     void irq_pulse_method()
     {
         m_irq_state = true;
-        if (irq.size() > 0) irq->write(true);
+        if (irq.size() > 0) {
+            irq->write(true);
+        }
         m_sig_irq_out.write(true);
+        if (m_tf) {
+            m_trace_irq.write(true);
+            sc_core::sc_time two_clk = 2u * m_sig_clk.read();
+            if (two_clk != sc_core::SC_ZERO_TIME)
+                m_irq_expire_ev.notify(two_clk);
+        }
     }
 
     /* ── irq_deassert_method ─────────────────────────────────────────────
@@ -598,34 +667,183 @@ private:
             m_sig_irq_out.write(false);
         }
     }
-    /* ── txd_line_method / rxd_line_method ──────────────────────────────────
-     * The Usart core drives m_sig_txd with USART_TxRx_Tlm structs (one per
-     * baud bit: START, DATA bits, optional PARITY, STOP).  The physical line
-     * level is always the LSB of the `data` field:
-     *   START bit : data=0, startOrStop=true → line LOW
-     *   STOP  bit : data=1, startOrStop=true → line HIGH
-     *   Data  bit : data = bit value           → line HIGH or LOW
-     *   Idle      : data=1 (mark)              → line HIGH
-     * rxd stays at idle (mark) in the SerialBridge architecture because bytes
-     * arrive via rx_inject() directly into RBUF, not through the serial pin.
+    /* ── IRQ pulse expire methods ───────────────────────────────────────────
+     * Each SC_METHOD fires after a timed sc_event::notify() from irq_method
+     * (tbir/rir/eir) or irq_pulse_method (irq), 2 f_PERIPH clock periods
+     * after the pulse was asserted.  No next_trigger(); no SC_THREAD.
      * ──────────────────────────────────────────────────────────────────── */
-    void txd_line_method()
+    void tbir_expire_method() { m_trace_tbir.write(false); }
+    void rir_expire_method()  { m_trace_rir.write(false);  }
+    void eir_expire_method()  { m_trace_eir.write(false);  }
+    void irq_expire_method()  { m_trace_irq.write(false);  }
+
+    /* ── TXD bit-level state machine ────────────────────────────────────────
+     *
+     * txd_enqueue_method: woken (via SC_MANY_WRITERS async path) when b_transport
+     * queues a new byte.  If the state machine is idle, dequeues the byte and
+     * fires m_txd_wave_ev immediately so txd_wave_method starts bit 0.
+     *
+     * txd_wave_method: one call per bit period.  Drives m_sig_txd_line for the
+     * current state, advances the state counter, and schedules the next firing
+     * via m_txd_wave_ev.notify(baud_period).  After the STOP bit it drives a
+     * 2-clock-period TIR pulse, then checks the queue for the next byte.
+     *
+     * m_txd_wave_state:  -1=idle  0=START  1..8=DATA  9=STOP  10=TIR_on  11=TIR_off
+     * ──────────────────────────────────────────────────────────────────── */
+    void txd_enqueue_method()
     {
-        m_sig_txd_line.write((m_sig_txd.read().data & 1u) != 0u);
+        if (m_txd_wave_state != -1) return;  // busy — byte stays in queue
+        uint8_t byte;
+        {
+            std::lock_guard<std::mutex> lk(m_txd_wave_mtx);
+            if (m_txd_wave_queue.empty()) return;
+            byte = m_txd_wave_queue.front();
+            m_txd_wave_queue.pop();
+        }
+        m_txd_wave_byte  = byte;
+        m_txd_wave_state = 0;
+        m_txd_wave_ev.notify(sc_core::SC_ZERO_TIME);
     }
 
-    void rxd_line_method()
+    void txd_wave_method()
     {
-        m_sig_rxd_line.write((m_sig_rxd.read().data & 1u) != 0u);
+        sc_core::sc_time bp = m_usart.get_baud_period();
+        sc_core::sc_time cp = m_sig_clk.read();
+        if (bp == sc_core::SC_ZERO_TIME) { m_txd_wave_state = -1; return; }
+
+        switch (m_txd_wave_state) {
+        case 0:                              // START bit
+            m_sig_txd_line.write(false);
+            m_txd_wave_state = 1;
+            m_txd_wave_ev.notify(bp);
+            break;
+        case 1: case 2: case 3: case 4:
+        case 5: case 6: case 7: case 8:     // DATA bits D0..D7
+            m_sig_txd_line.write(
+                (m_txd_wave_byte >> (m_txd_wave_state - 1)) & 1u);
+            ++m_txd_wave_state;
+            m_txd_wave_ev.notify(bp);
+            break;
+        case 9:                              // STOP bit
+            m_sig_txd_line.write(true);
+            m_txd_wave_state = (m_tf && cp != sc_core::SC_ZERO_TIME) ? 10 : 11;
+            m_txd_wave_ev.notify(bp);
+            break;
+        case 10:                             // TIR assert (after STOP bit elapses)
+            m_trace_tir.write(true);
+            m_txd_wave_state = 11;
+            m_txd_wave_ev.notify(2u * cp);
+            break;
+        default:                             // state 11: TIR deassert, check queue
+            m_trace_tir.write(false);
+            m_txd_wave_state = -1;
+            {   // pick up next queued byte immediately
+                std::lock_guard<std::mutex> lk(m_txd_wave_mtx);
+                if (!m_txd_wave_queue.empty()) {
+                    m_txd_wave_byte = m_txd_wave_queue.front();
+                    m_txd_wave_queue.pop();
+                    m_txd_wave_state = 0;
+                    m_txd_wave_ev.notify(sc_core::SC_ZERO_TIME);
+                }
+            }
+            break;
+        }
+    }
+
+    /* ── RXD bit-level state machine (same structure, no TIR) ───────────── */
+    void rxd_enqueue_method()
+    {
+        if (m_rxd_wave_state != -1) return;
+        uint8_t byte;
+        {
+            std::lock_guard<std::mutex> lk(m_rxd_wave_mtx);
+            if (m_rxd_wave_queue.empty()) return;
+            byte = m_rxd_wave_queue.front();
+            m_rxd_wave_queue.pop();
+        }
+        m_rxd_wave_byte  = byte;
+        m_rxd_wave_state = 0;
+        m_rxd_wave_ev.notify(sc_core::SC_ZERO_TIME);
+    }
+
+    void rxd_wave_method()
+    {
+        sc_core::sc_time bp = m_usart.get_baud_period();
+        if (bp == sc_core::SC_ZERO_TIME) { m_rxd_wave_state = -1; return; }
+
+        switch (m_rxd_wave_state) {
+        case 0:
+            m_sig_rxd_line.write(false);
+            m_rxd_wave_state = 1;
+            m_rxd_wave_ev.notify(bp);
+            break;
+        case 1: case 2: case 3: case 4:
+        case 5: case 6: case 7: case 8:
+            m_sig_rxd_line.write(
+                (m_rxd_wave_byte >> (m_rxd_wave_state - 1)) & 1u);
+            ++m_rxd_wave_state;
+            m_rxd_wave_ev.notify(bp);
+            break;
+        case 9:
+            m_sig_rxd_line.write(true);
+            m_rxd_wave_state = -1;
+            {
+                std::lock_guard<std::mutex> lk(m_rxd_wave_mtx);
+                if (!m_rxd_wave_queue.empty()) {
+                    m_rxd_wave_byte = m_rxd_wave_queue.front();
+                    m_rxd_wave_queue.pop();
+                    m_rxd_wave_state = 0;
+                    m_rxd_wave_ev.notify(bp);  // back-to-back: gap = STOP period
+                }
+            }
+            break;
+        default:
+            m_rxd_wave_state = -1;
+            break;
+        }
     }
 
     /* ── VCD trace signals and file ─────────────────────────────────────── */
-    sc_core::sc_signal<bool>    m_sig_txd_line; ///< physical TXD line level
-    sc_core::sc_signal<bool>    m_sig_rxd_line; ///< physical RXD line level
+    sc_core::sc_signal<bool>    m_sig_txd_line; ///< TXD physical line (driven by state machine)
+    sc_core::sc_signal<bool>    m_sig_rxd_line; ///< RXD physical line (driven by state machine)
     sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_irq_out; ///< mirror of irq output
 
-    cci::cci_param<std::string> m_vcd_file;     ///< basename; empty = disabled
-    sc_core::sc_trace_file*     m_tf;           ///< null when not tracing
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_trace_tbir;
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_trace_tir;
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_trace_rir;
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_trace_eir;
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_trace_irq;
+
+    sc_core::sc_event m_tbir_expire_ev;
+    sc_core::sc_event m_rir_expire_ev;
+    sc_core::sc_event m_eir_expire_ev;
+    sc_core::sc_event m_irq_expire_ev;
+
+    /* Wake-up signals for the txd/rxd state machines.  Written from QEMU
+     * thread (txd) or SC biflow thread (rxd) via SC_MANY_WRITERS async path. */
+    sc_core::sc_signal<unsigned int, sc_core::SC_MANY_WRITERS> m_sig_txd_wave;
+    sc_core::sc_signal<unsigned int, sc_core::SC_MANY_WRITERS> m_sig_rxd_wave;
+    std::atomic<unsigned int> m_txd_wave_cnt;
+    std::atomic<unsigned int> m_rxd_wave_cnt;
+
+    /* State machines for txd/rxd waveform generation. */
+    std::queue<uint8_t> m_txd_wave_queue;
+    std::mutex          m_txd_wave_mtx;
+    int                 m_txd_wave_state{-1};   ///< -1=idle, 0=START, 1-8=DATA, 9=STOP, 10-11=TIR
+    uint8_t             m_txd_wave_byte{0};
+    sc_core::sc_event   m_txd_wave_ev;
+
+    std::queue<uint8_t> m_rxd_wave_queue;
+    std::mutex          m_rxd_wave_mtx;
+    int                 m_rxd_wave_state{-1};   ///< -1=idle, 0=START, 1-8=DATA, 9=STOP
+    uint8_t             m_rxd_wave_byte{0};
+    sc_core::sc_event   m_rxd_wave_ev;
+
+    /* Pending trace IRQ mask — ORed from QEMU thread, consumed in irq_method. */
+    std::atomic<uint32_t> m_pending_trace_irqs;
+
+    cci::cci_param<std::string> m_vcd_file; ///< VCD basename; empty = disabled
+    sc_core::sc_trace_file*     m_tf;       ///< null when not tracing
 };
 
 extern "C" void module_register();

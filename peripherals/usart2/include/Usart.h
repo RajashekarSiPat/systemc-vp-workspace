@@ -181,6 +181,13 @@ SC_MODULE(Usart)
     // before update_status_from_core() gets to run.
     unsigned int get_tir_fire_count() const { return m_tir_fire_count; }
 
+    // Returns the full bit period based on current CON/BG register state:
+    //   bit_period = clk_period × prescaler × (BG_reload+1) × oversampling
+    // Prescaler: 1 (sync Mode 0), 3 (async BRS=1), 2 otherwise.
+    // Oversampling: 4 (sync), 16 (async).
+    // Returns SC_ZERO_TIME if clock not configured or R=0.
+    sc_core::sc_time get_baud_period() const;
+
     // =========================================================================
     // Direct RBUF accessors — do NOT call advance(), safe from any thread.
     // Used by Usart2::b_transport to serve RBUF reads without triggering the

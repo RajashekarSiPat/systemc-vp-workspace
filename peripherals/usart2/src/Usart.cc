@@ -1071,6 +1071,29 @@ bool Usart::rx_inject(uint8_t byte)
 // assertIrq — record assertion timestamp and drive the output high
 // ─────────────────────────────────────────────────────────────────────────────
 // The output will be de-asserted by updateIrqPulses() once
+// ─────────────────────────────────────────────────────────────────────────────
+// get_baud_period
+// ─────────────────────────────────────────────────────────────────────────────
+sc_core::sc_time Usart::get_baud_period() const
+{
+    if (m_clk_period == sc_core::SC_ZERO_TIME || !m_con.fields.R)
+        return sc_core::SC_ZERO_TIME;
+
+    unsigned prescaler;
+    unsigned oversample;
+    if (m_con.fields.M == USART_MODE_0) {
+        prescaler  = 1u;
+        oversample = 4u;   // sync: sub_tick 0..3
+    } else {
+        prescaler  = (m_con.fields.FDE || !m_con.fields.BRS) ? 2u : 3u;
+        oversample = 16u;  // async: sub_tick 0..15
+    }
+    double factor = static_cast<double>(prescaler)
+                  * static_cast<double>(m_bg_reload.raw + 1u)
+                  * static_cast<double>(oversample);
+    return m_clk_period * factor;
+}
+
 // (sc_time_stamp() - assert_time) >= 2 * m_clk_period.
 // ─────────────────────────────────────────────────────────────────────────────
 void Usart::assertIrq(sc_time       &assert_time,
