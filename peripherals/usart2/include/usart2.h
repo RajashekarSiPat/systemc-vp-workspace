@@ -159,7 +159,8 @@ public:
         sensitive << m_irq_event;
         dont_initialize();
 
-        /* irq_pulse_method: second half of the GIC pulse — drives HIGH.       */
+        /* irq_pulse_method: trace-only second half; GIC rising edge already
+         * issued in irq_method to avoid an inter-delta race window.          */
         SC_METHOD(irq_pulse_method);
         sensitive << m_irq_pulse_event;
         dont_initialize();
@@ -180,8 +181,9 @@ public:
         sensitive << m_sig_txd_wave;
         dont_initialize();
 
-        /* txd_wave_method: bit-level state machine for TXD waveform + TIR pulse.
-         * States: 0=START, 1-8=DATA bits, 9=STOP, 10=TIR_assert, 11=TIR_deassert.
+        /* txd_wave_method: bit-level state machine for TXD waveform.
+         * States: 0=START, 1-8=DATA bits, 9=STOP.  TIR trace pulse is issued via
+         * irq_method (2-clk expire, same as TBIR/RIR/EIR).
          * Each state drives m_sig_txd_line and schedules the next state via
          * m_txd_wave_ev.notify(baud_period).  No next_trigger(), no SC_THREAD. */
         SC_METHOD(txd_wave_method);
@@ -198,8 +200,9 @@ public:
         dont_initialize();
 
         /* Expire SC_METHODs: deassert trace pulse signals after 2 clk periods.
-         * Notified by irq_method (tbir/rir/eir) and irq_pulse_method (irq). */
+         * Notified by irq_method (tbir/tir/rir/eir) and irq_pulse_method (irq). */
         SC_METHOD(tbir_expire_method); sensitive << m_tbir_expire_ev; dont_initialize();
+        SC_METHOD(tir_expire_method);  sensitive << m_tir_expire_ev;  dont_initialize();
         SC_METHOD(rir_expire_method);  sensitive << m_rir_expire_ev;  dont_initialize();
         SC_METHOD(eir_expire_method);  sensitive << m_eir_expire_ev;  dont_initialize();
         SC_METHOD(irq_expire_method);  sensitive << m_irq_expire_ev;  dont_initialize();
@@ -240,6 +243,8 @@ public:
                 std::string n = name();
                 sc_core::sc_trace(m_tf, m_sig_txd_line, n + ".txd");
                 sc_core::sc_trace(m_tf, m_sig_rxd_line, n + ".rxd");
+                sc_core::sc_trace(m_tf, m_sig_txd,      n + ".txd_tlm");
+                sc_core::sc_trace(m_tf, m_sig_rxd,      n + ".rxd_tlm");
                 sc_core::sc_trace(m_tf, m_trace_tbir,   n + ".tbir");
                 sc_core::sc_trace(m_tf, m_trace_tir,    n + ".tir");
                 sc_core::sc_trace(m_tf, m_trace_rir,    n + ".rir");
@@ -389,6 +394,7 @@ private:
                 m_status |= STATUS_TIR;
                 m_tir_fired_count = tir_count;
                 new_irq = true;
+                m_pending_trace_irqs.fetch_or(STATUS_TIR, std::memory_order_relaxed);
                 SCP_INFO(()) << "TIR  fired (tir_fire_count=" << tir_count << ")";
             }
         }
@@ -590,20 +596,36 @@ private:
     }
 
     /* ── irq_method ──────────────────────────────────────────────────────
-     * Fires when m_sig_irq_seq changes — i.e., whenever update_status_from_core()
-     * detects a new IRQ rising edge.  Generates a GIC LOW→HIGH pulse:
-     *   • This delta: drive irq LOW (ensures falling edge before next rising)
-     *   • Next delta: irq_pulse_method drives irq HIGH (rising edge for GIC)
+     * Fires when m_irq_event is notified — i.e., whenever update_status_from_core()
+     * detects a new IRQ rising edge.  Issues the GIC rising edge in THIS delta:
      *
-     * Always doing LOW→HIGH rather than conditional writes means the GIC sees
-     * a fresh rising edge for every IRQ event regardless of current irq level.
+     *   Always write(false) then write(true), unconditionally.
+     *
+     *   InitiatorSignalSocket::write() calls qemu_set_irq_wrapper() on every
+     *   call regardless of the proxy's previous value.  For edge-triggered GIC,
+     *   qemu_set_irq(irq, 1) only generates a new PENDING if the GIC's internal
+     *   SPI level goes from 0 → 1.  If it was already 1 (e.g. after a previous
+     *   irq_method that was not followed by irq_deassert_method), the write(true)
+     *   would be a 1→1 no-op: no rising edge, no PENDING, no kick, permanent hang.
+     *
+     *   By always writing false first we guarantee the GIC level is 0 before
+     *   the rising edge, so the 0→1 transition always generates PENDING and a
+     *   kick.  For edge-triggered GIC, write(false) from level=0 is a complete
+     *   no-op (level 0→0, early-return in gic_set_irq), so there is no spurious
+     *   interrupt.
+     *
+     *   Both calls happen synchronously in this method (same SC delta), eliminating
+     *   the inter-delta race window of the old LOW(delta D) / HIGH(delta D+1) design.
      * ──────────────────────────────────────────────────────────────────── */
     void irq_method()
     {
-        if (irq.size() > 0) irq->write(false);
-        m_sig_irq_out.write(false);
-        m_irq_state = false;
-        m_irq_pulse_event.notify(sc_core::SC_ZERO_TIME);
+        if (irq.size() > 0) {
+            irq->write(false);  // always force LOW (no-op if already LOW)
+            irq->write(true);   // rising edge → GIC PENDING
+        }
+        m_sig_irq_out.write(true);
+        m_irq_state = true;
+        m_irq_pulse_event.notify(sc_core::SC_ZERO_TIME);  // trace signals only
 
         if (m_tf) {
             uint32_t mask = m_pending_trace_irqs.exchange(0u,
@@ -613,6 +635,10 @@ private:
                 if (mask & STATUS_TBIR) {
                     m_trace_tbir.write(true);
                     m_tbir_expire_ev.notify(two_clk);
+                }
+                if (mask & STATUS_TIR) {
+                    m_trace_tir.write(true);
+                    m_tir_expire_ev.notify(two_clk);
                 }
                 if (mask & STATUS_RIR) {
                     m_trace_rir.write(true);
@@ -627,16 +653,11 @@ private:
     }
 
     /* ── irq_pulse_method ────────────────────────────────────────────────
-     * Second half of the LOW→HIGH GIC pulse: drive irq HIGH so the GIC
-     * latches the rising edge.
+     * Trace-only second half: GIC rising edge is already issued in irq_method.
+     * Updates m_trace_irq and schedules its expiry for the VCD waveform.
      * ──────────────────────────────────────────────────────────────────── */
     void irq_pulse_method()
     {
-        m_irq_state = true;
-        if (irq.size() > 0) {
-            irq->write(true);
-        }
-        m_sig_irq_out.write(true);
         if (m_tf) {
             m_trace_irq.write(true);
             sc_core::sc_time two_clk = 2u * m_sig_clk.read();
@@ -673,6 +694,7 @@ private:
      * after the pulse was asserted.  No next_trigger(); no SC_THREAD.
      * ──────────────────────────────────────────────────────────────────── */
     void tbir_expire_method() { m_trace_tbir.write(false); }
+    void tir_expire_method()  { m_trace_tir.write(false);  }
     void rir_expire_method()  { m_trace_rir.write(false);  }
     void eir_expire_method()  { m_trace_eir.write(false);  }
     void irq_expire_method()  { m_trace_irq.write(false);  }
@@ -685,10 +707,11 @@ private:
      *
      * txd_wave_method: one call per bit period.  Drives m_sig_txd_line for the
      * current state, advances the state counter, and schedules the next firing
-     * via m_txd_wave_ev.notify(baud_period).  After the STOP bit it drives a
-     * 2-clock-period TIR pulse, then checks the queue for the next byte.
+     * via m_txd_wave_ev.notify(baud_period).  After the STOP bit it idles and
+     * checks the queue for the next byte.  TIR trace pulse is issued via
+     * irq_method (same 2-clk expire pattern as TBIR/RIR/EIR).
      *
-     * m_txd_wave_state:  -1=idle  0=START  1..8=DATA  9=STOP  10=TIR_on  11=TIR_off
+     * m_txd_wave_state:  -1=idle  0=START  1..8=DATA  9=STOP
      * ──────────────────────────────────────────────────────────────────── */
     void txd_enqueue_method()
     {
@@ -726,18 +749,12 @@ private:
             break;
         case 9:                              // STOP bit
             m_sig_txd_line.write(true);
-            m_txd_wave_state = (m_tf && cp != sc_core::SC_ZERO_TIME) ? 10 : 11;
+            m_txd_wave_state = 10;           // → idle/queue-check after STOP elapses
             m_txd_wave_ev.notify(bp);
             break;
-        case 10:                             // TIR assert (after STOP bit elapses)
-            m_trace_tir.write(true);
-            m_txd_wave_state = 11;
-            m_txd_wave_ev.notify(2u * cp);
-            break;
-        default:                             // state 11: TIR deassert, check queue
-            m_trace_tir.write(false);
+        default:                             // STOP elapsed → idle; pick up next byte
             m_txd_wave_state = -1;
-            {   // pick up next queued byte immediately
+            {
                 std::lock_guard<std::mutex> lk(m_txd_wave_mtx);
                 if (!m_txd_wave_queue.empty()) {
                     m_txd_wave_byte = m_txd_wave_queue.front();
@@ -815,6 +832,7 @@ private:
     sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_trace_irq;
 
     sc_core::sc_event m_tbir_expire_ev;
+    sc_core::sc_event m_tir_expire_ev;
     sc_core::sc_event m_rir_expire_ev;
     sc_core::sc_event m_eir_expire_ev;
     sc_core::sc_event m_irq_expire_ev;
@@ -829,7 +847,7 @@ private:
     /* State machines for txd/rxd waveform generation. */
     std::queue<uint8_t> m_txd_wave_queue;
     std::mutex          m_txd_wave_mtx;
-    int                 m_txd_wave_state{-1};   ///< -1=idle, 0=START, 1-8=DATA, 9=STOP, 10-11=TIR
+    int                 m_txd_wave_state{-1};   ///< -1=idle, 0=START, 1-8=DATA, 9=STOP
     uint8_t             m_txd_wave_byte{0};
     sc_core::sc_event   m_txd_wave_ev;
 
