@@ -425,15 +425,30 @@ private:
     }
 
     /* ── irq_method ─────────────────────────────────────────────────────── */
+    /* Step 1 of the two-delta IRQ pulse.
+     * Drives irq LOW unconditionally — even if it was already LOW — so that
+     * the subsequent write(true) in irq_pulse_method always produces a
+     * genuine LOW→HIGH rising edge visible to the GIC.  Without this split,
+     * write(false)+write(true) in the same SC process coalesce to a no-op
+     * when irq is already HIGH (sc_signal last-write-wins within one delta),
+     * and the GIC misses the edge after consecutive interrupts.            */
     void irq_method()
     {
-        if (irq.size() > 0) {
-            irq->write(false);
-            irq->write(true);
-        }
+        if (irq.size() > 0)
+            irq->write(false);          /* force LOW  (delta D)             */
+        m_sig_irq_out.write(false);
+        m_irq_state = false;
+        m_irq_pulse_event.notify(sc_core::SC_ZERO_TIME); /* HIGH in delta D+1 */
+    }
+
+    /* ── irq_pulse_method ───────────────────────────────────────────────── */
+    /* Step 2: drive HIGH, producing the guaranteed rising edge for the GIC. */
+    void irq_pulse_method()
+    {
+        if (irq.size() > 0)
+            irq->write(true);           /* LOW→HIGH edge (delta D+1)        */
         m_sig_irq_out.write(true);
         m_irq_state = true;
-        m_irq_pulse_event.notify(sc_core::SC_ZERO_TIME);
 
         if (m_tf) {
             uint32_t mask = m_pending_trace_irqs.exchange(0u,
@@ -457,15 +472,7 @@ private:
                     m_eir_expire_ev.notify(two_clk);
                 }
             }
-        }
-    }
-
-    /* ── irq_pulse_method ───────────────────────────────────────────────── */
-    void irq_pulse_method()
-    {
-        if (m_tf) {
             m_trace_irq.write(true);
-            sc_core::sc_time two_clk = 2u * m_sig_clk.read();
             if (two_clk != sc_core::SC_ZERO_TIME)
                 m_irq_expire_ev.notify(two_clk);
         }
@@ -572,8 +579,8 @@ private:
     }
 
     /* ── VCD trace signals ──────────────────────────────────────────────── */
-    sc_core::sc_signal<bool>    m_sig_txd_line; ///< LOW=frame in progress, HIGH=idle
-    sc_core::sc_signal<bool>    m_sig_rxd_line; ///< LOW=frame in progress, HIGH=idle
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_txd_line; ///< LOW=frame in progress, HIGH=idle
+    sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_rxd_line; ///< LOW=frame in progress, HIGH=idle
     sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_irq_out;
 
     sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_trace_tbir;
