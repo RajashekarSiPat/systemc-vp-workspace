@@ -188,6 +188,13 @@ SC_MODULE(Usart)
     // Returns SC_ZERO_TIME if clock not configured or R=0.
     sc_core::sc_time get_baud_period() const;
 
+    // Returns the duration of one complete serial frame:
+    //   frame_duration = baud_period × (1 + data_bits + parity_bits + stop_bits)
+    // Async example — 8N1: 10 bit-periods; 8+P 2-stop: 12 bit-periods.
+    // Sync  (Mode 0): data_bits only (no start/stop).
+    // Returns SC_ZERO_TIME if clock not configured or R=0.
+    sc_core::sc_time get_frame_duration() const;
+
     // =========================================================================
     // Direct RBUF accessors — do NOT call advance(), safe from any thread.
     // Used by Usart2::b_transport to serve RBUF reads without triggering the

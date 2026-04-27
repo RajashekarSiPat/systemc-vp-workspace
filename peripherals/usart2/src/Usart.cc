@@ -1072,6 +1072,27 @@ bool Usart::rx_inject(uint8_t byte)
 // ─────────────────────────────────────────────────────────────────────────────
 // The output will be de-asserted by updateIrqPulses() once
 // ─────────────────────────────────────────────────────────────────────────────
+// get_frame_duration
+// ─────────────────────────────────────────────────────────────────────────────
+sc_core::sc_time Usart::get_frame_duration() const
+{
+    sc_core::sc_time bp = get_baud_period();
+    if (bp == sc_core::SC_ZERO_TIME) return sc_core::SC_ZERO_TIME;
+
+    uint8_t mode = m_con.fields.M;
+    int bits;
+    if (mode == USART_MODE_0) {
+        bits = static_cast<int>(usart_data_bits(mode)); // sync: data only, no start/stop
+    } else {
+        int data  = static_cast<int>(usart_data_bits(mode));
+        int par   = usart_mode_has_hw_parity(mode) ? 1 : 0;
+        int stop  = static_cast<int>(usart_stop_bits(mode, m_con.fields.STP));
+        bits = 1 + data + par + stop;
+    }
+    return bp * static_cast<double>(bits);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // get_baud_period
 // ─────────────────────────────────────────────────────────────────────────────
 sc_core::sc_time Usart::get_baud_period() const
