@@ -56,12 +56,6 @@ void SerialBridge::recv_from_a(tlm_generic_payload& txn, sc_time& /*t*/)
     SCP_TRACE(()) << "bridge A→B: " << len << " byte(s)";
     for (unsigned i = 0u; i < len; ++i)
         socket_b.enqueue(ptr[i]);
-    /* No can_receive_more() — socket_a uses can_receive_any() (infinite credits).
-     *
-     * enqueue() wakes the SC thread via gs::async_event so rx_receive runs in
-     * SC context; this is more reliable than force_send (which would call
-     * rx_receive directly from the QEMU thread, requiring async_request_update
-     * to reach the SC scheduler — a weaker notification path). */
 }
 
 // -----------------------------------------------------------------------------
@@ -76,7 +70,6 @@ void SerialBridge::recv_from_b(tlm_generic_payload& txn, sc_time& /*t*/)
     SCP_TRACE(()) << "bridge B→A: " << len << " byte(s)";
     for (unsigned i = 0u; i < len; ++i)
         socket_a.enqueue(ptr[i]);
-    /* Same rationale as recv_from_a: use enqueue, not force_send. */
 }
 
 // -----------------------------------------------------------------------------

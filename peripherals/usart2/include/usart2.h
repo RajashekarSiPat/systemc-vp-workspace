@@ -68,6 +68,7 @@
 #include <cstring>
 #include <mutex>
 #include <queue>
+#include <thread>
 #include <unistd.h>   /* write() for async-signal-safe tracing */
 #include <systemc>
 #include "tlm.h"
@@ -137,7 +138,6 @@ public:
         , m_trace_eir("trace_eir")
         , m_trace_irq("trace_irq")
         , m_txd_busy(false)
-        , m_rxd_busy(false)
         , m_rxd_frame_byte(0u)
         , m_pending_trace_irqs(0u)
         , m_vcd_file("vcd_file", "",
@@ -172,15 +172,10 @@ public:
         sensitive << m_sig_tbir << m_sig_tir << m_sig_rir << m_sig_eir;
         dont_initialize();
 
-        /* tir_detect_method: fires in the SC scheduler when the Usart core's
-         * tir signal rises (txDoneMethod → assertIrq → tir.write(true)).
-         * Detecting TIR here, rather than inside update_status_from_core(),
-         * guarantees TIR fires as a separate IRQ from TBIR: the SC event fires
-         * at frame_duration after the TBUF write, well before the next TBUF
-         * write arrives from QEMU, so they can never share an ISR call.      */
-        SC_METHOD(tir_detect_method);
-        sensitive << m_sig_tir;
-        dont_initialize();
+        /* TIR is detected in update_status_from_core(check_tir=true), which is
+         * called only on non-TBUF register accesses (CON, BG, FDR reads).
+         * This prevents TIR from firing spontaneously between bytes and
+         * corrupting the wait_n(base+2) count in test4.                     */
 
         /* tx_start_method: woken (via gs::async_event) when b_transport queues
          * a byte for TX waveform tracing.  Computes the full frame duration once
@@ -195,21 +190,8 @@ public:
         sensitive << m_txd_done_ev;
         dont_initialize();
 
-        /* rxd_start_method: woken (via gs::async_event) when rx_receive queues
-         * a byte from the biflow backend (QEMU thread).  Runs in the SC
-         * scheduler so m_rxd_done_ev.notify(fd) is called from the correct
-         * thread context — the same reason tx_start_method uses m_txd_start_ev
-         * rather than calling txd_try_start() directly from b_transport.    */
-        SC_METHOD(rxd_start_method);
-        sensitive << m_rxd_start_ev;
-        dont_initialize();
-
-        /* rx_done_method: fires after one frame_duration from byte arrival.
-         * Performs the deferred rx_inject into the Usart core's RBUF and
-         * asserts RIR / EIR via update_status_from_core().                  */
-        SC_METHOD(rx_done_method);
-        sensitive << m_rxd_done_ev;
-        dont_initialize();
+        /* rx_receive injects bytes immediately (called from SC thread via
+         * the biflow socket's sendall SC_METHOD).  No deferred frame timer. */
 
         SC_METHOD(tbir_expire_method); sensitive << m_tbir_expire_ev; dont_initialize();
         SC_METHOD(tir_expire_method);  sensitive << m_tir_expire_ev;  dont_initialize();
@@ -303,8 +285,14 @@ private:
 
     sc_core::sc_event m_irq_pulse_event;
 
-    /* ── update_status_from_core ──────────────────────────────────────────*/
-    void update_status_from_core()
+    /* ── update_status_from_core ─────────────────────────────────────────────
+     * check_tir=false: called from TBUF write and RX inject paths — detects
+     *   TBIR/RIR/EIR only.  Skipping TIR prevents it from bundling with TBIR
+     *   in the same ISR call (which would exhaust wait_n before RIR fires).
+     * check_tir=true: called from CON/BG/FDR accesses (test5 polling path)
+     *   — also detects pending TIR so the firmware's UA_CON-read loop sees it.
+     * ──────────────────────────────────────────────────────────────────────── */
+    void update_status_from_core(bool check_tir = false)
     {
         if (irq.size() == 0u) return;
 
@@ -318,10 +306,16 @@ private:
             SCP_INFO(()) << "TBIR fired (tbuf_write_count=" << m_tbuf_write_count << ")";
         }
 
-        /* TIR is handled exclusively by tir_detect_method (SC-thread context),
-         * which fires when m_sig_tir rises.  Detecting it here (QEMU-thread
-         * context) would bundle TIR with the next TBIR in the same ISR call,
-         * causing wait_n to return before RIR has been logged.               */
+        if (check_tir) {
+            unsigned int tir_count = m_usart.get_tir_fire_count();
+            if (tir_count > m_tir_fired_count) {
+                m_status |= STATUS_TIR;
+                m_tir_fired_count = tir_count;
+                new_irq = true;
+                m_pending_trace_irqs.fetch_or(STATUS_TIR, std::memory_order_relaxed);
+                SCP_INFO(()) << "TIR  fired (tir_fire_count=" << tir_count << ")";
+            }
+        }
 
         if (m_usart.is_rir_asserted() && m_rx_accept_count > m_rir_fired_count) {
             m_status |= STATUS_RIR;
@@ -376,7 +370,8 @@ private:
             return;
         }
 
-        /* ── TBUF write: send byte to biflow backend ────────────────────── */
+        /* ── TBUF write: send byte to biflow backend (→ serial_bridge enqueue) */
+        bool is_tbuf_write = false;
         if (trans.get_command() == tlm::TLM_WRITE_COMMAND &&
             offset == USART_TBUF_OFFSET)
         {
@@ -402,14 +397,11 @@ private:
                 backend_socket.force_send(fwd_txn);
             }
             ++m_tbuf_write_count;
+            is_tbuf_write = true;
 
-            /* Queue byte for TX waveform tracing and wake the SC-side
-             * tx_start_method via async_event (safe from QEMU thread). */
             if (m_tf) {
-                {
-                    std::lock_guard<std::mutex> lk(m_txd_mtx);
-                    m_txd_queue.push(byte);
-                }
+                std::lock_guard<std::mutex> lk(m_txd_mtx);
+                m_txd_queue.push(byte);
                 m_txd_start_ev.notify(sc_core::SC_ZERO_TIME);
             }
         }
@@ -419,7 +411,19 @@ private:
         m_bus_fwd->b_transport(trans, delay);
         trans.set_address(offset);
 
-        update_status_from_core();
+        /* For TBUF writes (check_tir=false): detect TBIR only.
+         * TIR is suppressed here to prevent it from firing spontaneously
+         * between bytes and corrupting wait_n(base+2) in test4.
+         * For CON/BG/FDR accesses (check_tir=true): also detect pending TIR.
+         * Test5's UA_CON polling loop triggers this path to observe TIR.  */
+        update_status_from_core(!is_tbuf_write);
+
+        /* After a TBUF write, yield the QEMU thread so the SC scheduler gets
+         * CPU time to process the TBIR and RIR async updates before wait_n's
+         * WFI executes.  Without this, both threads compete for the same CPU
+         * core and the async events may be processed too late.              */
+        if (is_tbuf_write)
+            std::this_thread::yield();
     }
 
     /* ── rx_receive ──────────────────────────────────────────────────────────
@@ -428,23 +432,21 @@ private:
      * (rxd_try_start).  Actual RBUF injection happens in rx_done_method after
      * one frame_duration, modelling the time the serial line is occupied.
      * ──────────────────────────────────────────────────────────────────────── */
+    /* ── rx_receive ──────────────────────────────────────────────────────────
+     * Called from the SC scheduler thread via the biflow socket's sendall()
+     * SC_METHOD (serial_bridge uses enqueue, not force_send).  Injects bytes
+     * directly: no deferred frame timer, no queue, no busy flag.
+     * The VCD rxd waveform is omitted (m_sig_rxd_line stays idle-HIGH).
+     * ──────────────────────────────────────────────────────────────────────── */
     void rx_receive(tlm::tlm_generic_payload& txn, sc_core::sc_time& /*t*/)
     {
         uint8_t* ptr = txn.get_data_ptr();
         unsigned len = txn.get_data_length();
-        {
-            std::lock_guard<std::mutex> lk(m_rxd_mtx);
-            for (unsigned i = 0u; i < len; ++i)
-                m_rxd_pending_q.push(ptr[i]);
+        for (unsigned i = 0u; i < len; ++i) {
+            m_rxd_frame_byte = ptr[i];
+            rxd_inject_frame_byte();
         }
-        m_rxd_start_ev.notify();   /* gs::async_event — safe from QEMU thread */
     }
-
-    /* rxd_start_method — SC-thread entry point for bytes queued by rx_receive.
-     * m_rxd_done_ev.notify(fd) must be called from the SC scheduler thread;
-     * calling it from the QEMU thread (as rx_receive previously did) is UB
-     * and causes lost events under certain timing conditions.               */
-    void rxd_start_method() { rxd_try_start(); }
 
     /* ── irq_method ─────────────────────────────────────────────────────── */
     /* Step 1 of the two-delta IRQ pulse.
@@ -518,25 +520,6 @@ private:
     void eir_expire_method()  { m_trace_eir.write(false);  }
     void irq_expire_method()  { m_trace_irq.write(false);  }
 
-    /* ── tir_detect_method ──────────────────────────────────────────────────
-     * Fires in the SC scheduler when m_sig_tir changes.  On the rising edge
-     * (txDoneMethod → Usart::assertIrq → tir.write(true)), update STATUS and
-     * deliver a dedicated IRQ.  This guarantees TIR is an independent event,
-     * never bundled with TBIR or RIR in the same ISR call.                  */
-    void tir_detect_method()
-    {
-        if (!m_sig_tir.read()) return;   /* ignore falling edge */
-        if (irq.size() == 0u)  return;
-        unsigned int tir_count = m_usart.get_tir_fire_count();
-        if (tir_count > m_tir_fired_count) {
-            m_status |= STATUS_TIR;
-            m_tir_fired_count = tir_count;
-            m_pending_trace_irqs.fetch_or(STATUS_TIR, std::memory_order_relaxed);
-            SCP_INFO(()) << "TIR  fired (tir_fire_count=" << tir_count << ")";
-            m_irq_event.notify(sc_core::SC_ZERO_TIME);
-        }
-    }
-
     /* ── TX frame-level waveform ─────────────────────────────────────────────
      *
      * tx_start_method: pops the next byte from m_txd_queue, drives txd_line
@@ -581,35 +564,6 @@ private:
      * calls update_status_from_core() to assert RIR / EIR, then chains the
      * next pending byte.
      * ──────────────────────────────────────────────────────────────────────── */
-    void rx_done_method()
-    {
-        if (m_tf) m_sig_rxd_line.write(true);    // back to idle
-        m_rxd_busy = false;
-        rxd_inject_frame_byte();
-        rxd_try_start();
-    }
-
-    void rxd_try_start()
-    {
-        while (!m_rxd_busy) {
-            {
-                std::lock_guard<std::mutex> lk(m_rxd_mtx);
-                if (m_rxd_pending_q.empty()) return;
-                m_rxd_frame_byte = m_rxd_pending_q.front();
-                m_rxd_pending_q.pop();
-            }
-            sc_core::sc_time fd = m_usart.get_frame_duration();
-            if (fd != sc_core::SC_ZERO_TIME) {
-                m_rxd_busy = true;
-                if (m_tf) m_sig_rxd_line.write(false); // LOW = frame in progress
-                m_rxd_done_ev.notify(fd);
-                return;
-            }
-            /* Baud not yet configured — inject immediately without timing. */
-            rxd_inject_frame_byte();
-        }
-    }
-
     void rxd_inject_frame_byte()
     {
         if (m_usart.rx_inject(m_rxd_frame_byte)) {
@@ -647,13 +601,8 @@ private:
     std::mutex               m_txd_mtx;      ///< protects m_txd_queue
     bool                     m_txd_busy;     ///< true while a TX frame timer runs
 
-    /* ── RX deferred-injection state ────────────────────────────────────── */
-    gs::async_event           m_rxd_start_ev;     ///< async: wakes SC from QEMU thread
-    sc_core::sc_event         m_rxd_done_ev;      ///< fires after frame_duration (SC thread)
-    std::queue<uint8_t>       m_rxd_pending_q;    ///< bytes awaiting injection
-    std::mutex                m_rxd_mtx;          ///< protects m_rxd_pending_q
-    uint8_t                   m_rxd_frame_byte;   ///< byte held for current frame
-    bool                      m_rxd_busy;         ///< true while RX frame timer runs
+    /* ── RX injection state ─────────────────────────────────────────────── */
+    uint8_t m_rxd_frame_byte;   ///< current byte being injected (set in rx_receive)
 
     /* ── Pending trace IRQ mask ─────────────────────────────────────────── */
     std::atomic<uint32_t> m_pending_trace_irqs;
