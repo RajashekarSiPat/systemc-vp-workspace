@@ -64,6 +64,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -418,12 +419,16 @@ private:
          * Test5's UA_CON polling loop triggers this path to observe TIR.  */
         update_status_from_core(!is_tbuf_write);
 
-        /* After a TBUF write, yield the QEMU thread so the SC scheduler gets
-         * CPU time to process the TBIR and RIR async updates before wait_n's
-         * WFI executes.  Without this, both threads compete for the same CPU
-         * core and the async events may be processed too late.              */
+        /* After a TBUF write, sleep the QEMU thread so the SC scheduler gets
+         * guaranteed wall-clock time to complete the full biflow-enqueue →
+         * usart2_b.rx_receive → RIR_B → irq_pulse chain before the firmware
+         * enters WFI.  A single yield() is not enough: yield only donates one
+         * OS scheduling slice, but the async_event + multiple SC delta cycles
+         * can easily span several slices.  500 µs is orders of magnitude longer
+         * than the SC thread needs (~tens of µs) while adding negligible
+         * simulation overhead (USART frame_duration is already ~3.2 µs).    */
         if (is_tbuf_write)
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
 
     /* ── rx_receive ──────────────────────────────────────────────────────────
