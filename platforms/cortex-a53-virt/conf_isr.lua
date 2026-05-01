@@ -72,7 +72,7 @@ platform = {
         moduletype  = "QemuInstance",
         args        = { "&qemu_inst_mgr", "AARCH64" },
         accel       = "tcg",
-        sync_policy = "multithread-unconstrained",
+        sync_policy = "multithread",
     },
 
     -- -----------------------------------------------------------------------
@@ -153,7 +153,6 @@ platform = {
         },
         backend_socket = { bind = "&serial_bridge_0.socket_a" },
         irq            = { bind = "&gic_0.spi_in_0" },
-        vcd_file       = "/tmp/usart2_a",
     },
 
     -- -----------------------------------------------------------------------
@@ -169,7 +168,6 @@ platform = {
         },
         backend_socket = { bind = "&serial_bridge_0.socket_b" },
         irq            = { bind = "&gic_0.spi_in_1" },
-        vcd_file       = "/tmp/usart2_b",
     },
 
     -- -----------------------------------------------------------------------

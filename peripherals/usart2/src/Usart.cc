@@ -271,16 +271,30 @@ void Usart::txDoneMethod()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// irqDeassertMethod — fires 2 * m_clk_period after assertIrq()
+// irqDeassertMethod — fires in the next delta cycle after assertIrq()
 //
-// Drives any expired IRQ output LOW.  Multiple IRQs asserting close together
-// all share this single event; updateIrqPulses() handles each independently
-// via its timestamp comparison.
+// Drives all active IRQ outputs LOW immediately (bypasses the 2-cycle
+// pulse-width check used by updateIrqPulses).  assertIrq() now schedules
+// the deassert at SC_ZERO_TIME so the de-assertion happens within the same
+// SC-time epoch as the assertion — this avoids requiring the SC scheduler
+// to advance real simulated time (which is gated by the QEMU thread's local
+// time and can stall in multithread-unconstrained mode while the QEMU thread
+// is blocked in sleep_for()).  The advance() / updateIrqPulses() path still
+// handles late de-assertions if the event fires after the time has moved.
 // ─────────────────────────────────────────────────────────────────────────────
 void Usart::irqDeassertMethod()
 {
     DBG_FN(4);
-    updateIrqPulses(sc_time_stamp());
+    auto deassert = [](sc_core::sc_time &atime, sc_out<bool> &port) {
+        if (atime != sc_core::SC_ZERO_TIME) {
+            port.write(false);
+            atime = sc_core::SC_ZERO_TIME;
+        }
+    };
+    deassert(m_tbir_assert_time, tbir);
+    deassert(m_tir_assert_time,  tir);
+    deassert(m_rir_assert_time,  rir);
+    deassert(m_eir_assert_time,  eir);
 }
 
 // =============================================================================
@@ -521,10 +535,15 @@ void Usart::assertIrq(sc_time       &assert_time,
     assert_time = t;
     port.write(true);
 
-    // Schedule de-assertion after 2 peripheral clock periods.
-    // irqDeassertMethod calls updateIrqPulses which handles all four signals.
-    if (m_clk_period != sc_core::SC_ZERO_TIME)
-        m_irq_deassert_ev.notify(m_clk_period * 2.0);
+    // Schedule de-assertion in the NEXT delta cycle (SC_ZERO_TIME) rather than
+    // after 2 × m_clk_period.  Advancing SC simulated time by 20 ns requires the
+    // QEMU thread to have already pushed its local time past that point via the
+    // quantum keeper — this cannot happen while the QEMU thread is blocked in
+    // sleep_for(), causing irqDeassertMethod to fire OUTSIDE the sleep window and
+    // accumulate as a pending SC-time event for the next byte's sleep.  Using
+    // SC_ZERO_TIME keeps the deassert within the same delta epoch and eliminates
+    // the cross-quantum scheduling backlog that caused ~70 % of test4 runs to hang.
+    m_irq_deassert_ev.notify(sc_core::SC_ZERO_TIME);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

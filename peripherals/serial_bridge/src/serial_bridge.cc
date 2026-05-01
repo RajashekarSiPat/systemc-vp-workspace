@@ -21,6 +21,10 @@ SerialBridge::SerialBridge(sc_module_name name)
     socket_b.register_b_transport(this, &SerialBridge::recv_from_b);
     /* NOTE: do NOT call can_receive_set() here — sockets not yet bound.
      * Call in start_of_simulation() after all connections are resolved. */
+
+    SC_METHOD(wakeup_method);
+    sensitive << m_wakeup_ev;
+    dont_initialize();
 }
 
 // -----------------------------------------------------------------------------
@@ -53,9 +57,11 @@ void SerialBridge::recv_from_a(tlm_generic_payload& txn, sc_time& /*t*/)
     uint8_t* ptr = txn.get_data_ptr();
     unsigned len = txn.get_data_length();
 
-    SCP_TRACE(()) << "bridge A→B: " << len << " byte(s)";
-    for (unsigned i = 0u; i < len; ++i)
+    SCP_INFO(()) << "bridge A→B: " << len << " byte(s) [0x" << std::hex << (unsigned)ptr[0] << "]";
+    for (unsigned i = 0u; i < len; ++i) {
         socket_b.enqueue(ptr[i]);
+        m_wakeup_ev.notify(sc_core::SC_ZERO_TIME);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -68,9 +74,13 @@ void SerialBridge::recv_from_b(tlm_generic_payload& txn, sc_time& /*t*/)
     unsigned len = txn.get_data_length();
 
     SCP_TRACE(()) << "bridge B→A: " << len << " byte(s)";
-    for (unsigned i = 0u; i < len; ++i)
+    for (unsigned i = 0u; i < len; ++i) {
         socket_a.enqueue(ptr[i]);
+        m_wakeup_ev.notify(sc_core::SC_ZERO_TIME);
+    }
 }
+
+void SerialBridge::wakeup_method() { /* no-op: purpose is solely to wake SC scheduler */ }
 
 // -----------------------------------------------------------------------------
 // Module registration — required by QBOX ModuleFactory / gs_create_dymod

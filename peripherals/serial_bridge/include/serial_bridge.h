@@ -20,6 +20,7 @@
 #include <systemc>
 #include "tlm.h"
 #include <ports/biflow-socket.h>
+#include <async_event.h>
 #include <module_factory_registery.h>
 #include <scp/report.h>
 
@@ -44,6 +45,15 @@ private:
 
     /* Called when USART-B sends a byte (its TX) → forward to USART-A (its RX) */
     void recv_from_b(tlm::tlm_generic_payload& txn, sc_core::sc_time& t);
+
+    /* biflow_socket's m_send_event is async_detach_suspending()-ed when
+     * can_receive_any() (INFINITE_VALUE) is used, so enqueue() posts an
+     * async_request_update() that does NOT wake a sleeping SC scheduler.
+     * m_wakeup_ev (start_attached=true by default) is notified alongside
+     * every enqueue() call to guarantee the SC scheduler wakes and processes
+     * the biflow sendall SC_METHOD in the same delta cycle.               */
+    gs::async_event m_wakeup_ev;
+    void wakeup_method();
 };
 
 extern "C" void module_register();

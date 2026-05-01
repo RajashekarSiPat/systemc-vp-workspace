@@ -169,15 +169,6 @@ public:
         sensitive << m_irq_pulse_event;
         dont_initialize();
 
-        SC_METHOD(irq_deassert_method);
-        sensitive << m_sig_tbir << m_sig_tir << m_sig_rir << m_sig_eir;
-        dont_initialize();
-
-        /* TIR is detected in update_status_from_core(check_tir=true), which is
-         * called only on non-TBUF register accesses (CON, BG, FDR reads).
-         * This prevents TIR from firing spontaneously between bytes and
-         * corrupting the wait_n(base+2) count in test4.                     */
-
         /* tx_start_method: woken (via gs::async_event) when b_transport queues
          * a byte for TX waveform tracing.  Computes the full frame duration once
          * and schedules m_txd_done_ev — no per-bit stepping.               */
@@ -428,7 +419,7 @@ private:
          * than the SC thread needs (~tens of µs) while adding negligible
          * simulation overhead (USART frame_duration is already ~3.2 µs).    */
         if (is_tbuf_write)
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            std::this_thread::sleep_for(std::chrono::microseconds(2000));
     }
 
     /* ── rx_receive ──────────────────────────────────────────────────────────
@@ -504,18 +495,6 @@ private:
             m_trace_irq.write(true);
             if (two_clk != sc_core::SC_ZERO_TIME)
                 m_irq_expire_ev.notify(two_clk);
-        }
-    }
-
-    /* ── irq_deassert_method ────────────────────────────────────────────── */
-    void irq_deassert_method()
-    {
-        bool asserted = m_sig_tbir.read() || m_sig_tir.read() ||
-                        m_sig_rir.read()  || m_sig_eir.read();
-        if (!asserted && m_irq_state) {
-            m_irq_state = false;
-            if (irq.size() > 0) irq->write(false);
-            m_sig_irq_out.write(false);
         }
     }
 
