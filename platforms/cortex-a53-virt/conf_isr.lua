@@ -153,6 +153,7 @@ platform = {
         },
         backend_socket = { bind = "&serial_bridge_0.socket_a" },
         irq            = { bind = "&gic_0.spi_in_0" },
+        vcd_file       = "/tmp/usart2_a",
     },
 
     -- -----------------------------------------------------------------------
@@ -168,6 +169,7 @@ platform = {
         },
         backend_socket = { bind = "&serial_bridge_0.socket_b" },
         irq            = { bind = "&gic_0.spi_in_1" },
+        vcd_file       = "/tmp/usart2_b",
     },
 
     -- -----------------------------------------------------------------------
