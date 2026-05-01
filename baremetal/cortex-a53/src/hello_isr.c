@@ -309,24 +309,31 @@ static unsigned int test_begin(void)
 /* ═══════════════════════════════════════════════════════════════════════════
  * Test 1: A → B  (0x55)
  * Expected: TBIR_A fires (USART_A INT), then RIR_B fires (USART_B INT).
- * TIR_A may also appear if advance() completes the TX frame in one call.
+ * TIR_A fires at T+frame_duration via tir_auto_method (SC_METHOD on m_sig_tir.pos()).
+ * RIR_B fires at T+frame_duration via deferred m_rxd_done_ev.
+ * Expected sequence: TBIR_A (T+0) → TIR_A (T+3.2µs) → RIR_B (T+3.2µs+δ).
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void test1(void)
 {
     unsigned int base, data;
 
-    put_str("Test 1: A sends 0x55, expect TBIR_A + RIR_B\r\n");
+    put_str("Test 1: A sends 0x55, expect TBIR_A + TIR_A + RIR_B\r\n");
     base = test_begin();
     UA_TBUF = 0x55u;
 
-    /* Wait for at least one event from each USART (min 2 total). */
-    if (!wait_n(base + 2u)) {
+    /* Wait for 3 events: TBIR_A (T+0), TIR_A (T+3.2µs), RIR_B (T+3.2µs+δ). */
+    if (!wait_n(base + 3u)) {
         fail_test("T1", "IRQ timeout"); return;
     }
     if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
         fail_test("T1-TBIR_A", "not in ISR log"); return;
     }
     put_str("  [ISR] TBIR_A confirmed\r\n");
+
+    if (find_event(base, IRQ_USART_A, STATUS_TIR) < 0) {
+        fail_test("T1-TIR_A", "not in ISR log"); return;
+    }
+    put_str("  [ISR] TIR_A  confirmed\r\n");
 
     if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
         fail_test("T1-RIR_B", "not in ISR log"); return;
@@ -346,17 +353,22 @@ static void test2(void)
 {
     unsigned int base, data;
 
-    put_str("Test 2: B sends 0xAA, expect TBIR_B + RIR_A\r\n");
+    put_str("Test 2: B sends 0xAA, expect TBIR_B + TIR_B + RIR_A\r\n");
     base = test_begin();
     UB_TBUF = 0xAAu;
 
-    if (!wait_n(base + 2u)) {
+    if (!wait_n(base + 3u)) {
         fail_test("T2", "IRQ timeout"); return;
     }
     if (find_event(base, IRQ_USART_B, STATUS_TBIR) < 0) {
         fail_test("T2-TBIR_B", "not in ISR log"); return;
     }
     put_str("  [ISR] TBIR_B confirmed\r\n");
+
+    if (find_event(base, IRQ_USART_B, STATUS_TIR) < 0) {
+        fail_test("T2-TIR_B", "not in ISR log"); return;
+    }
+    put_str("  [ISR] TIR_B  confirmed\r\n");
 
     if (find_event(base, IRQ_USART_A, STATUS_RIR) < 0) {
         fail_test("T2-RIR_A", "not in ISR log"); return;
@@ -382,12 +394,8 @@ static void test3(void)
     base = test_begin();
     UA_TBUF = 0x11u;
 
-    /* Wait for 2 events: TBIR_A (from the TBUF write) and RIR_B (from the
-     * biflow delivery to USART_B).  TBIR_A fires synchronously inside the
-     * b_transport for UA_TBUF; RIR_B fires asynchronously (next delta) via
-     * the bridge.  Waiting for count+1 could return after TBIR_A before
-     * RIR_B is logged, causing find_event(RIR_B) to fail spuriously.     */
-    if (!wait_n(base + 2u)) {
+    /* Wait for 3 events: TBIR_A (T+0), TIR_A (T+3.2µs), RIR_B (T+3.2µs+δ). */
+    if (!wait_n(base + 3u)) {
         fail_test("T3-RIR_B", "first byte timeout"); return;
     }
     if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
@@ -399,8 +407,8 @@ static void test3(void)
     base = g_log_count;
     UA_TBUF = 0x22u;
 
-    /* Wait for 2 events: TBIR_A + EIR_B. */
-    if (!wait_n(base + 2u)) {
+    /* Wait for 3 events: TBIR_A + TIR_A + EIR_B. */
+    if (!wait_n(base + 3u)) {
         fail_test("T3-EIR_B", "EIR timeout"); return;
     }
     if (find_event(base, IRQ_USART_B, STATUS_EIR) < 0) {
@@ -433,7 +441,8 @@ static void test4(void)
         base = g_log_count;
         UA_TBUF = exp;
 
-        if (!wait_n(base + 2u)) {
+        /* 3 events per byte: TBIR_A (T+0), TIR_A (T+3.2µs), RIR_B (T+3.2µs+δ). */
+        if (!wait_n(base + 3u)) {
             put_str("  timeout byte "); put_hex(exp); put_str("\r\n");
             ok = 0; break;
         }
@@ -441,8 +450,12 @@ static void test4(void)
             put_str("  TBIR_A missing for byte "); put_hex(exp); put_str("\r\n");
             ok = 0; break;
         }
+        if (find_event(base, IRQ_USART_A, STATUS_TIR) < 0) {
+            put_str("  TIR_A  missing for byte "); put_hex(exp); put_str("\r\n");
+            ok = 0; break;
+        }
         if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
-            put_str("  RIR_B missing for byte "); put_hex(exp); put_str("\r\n");
+            put_str("  RIR_B  missing for byte "); put_hex(exp); put_str("\r\n");
             ok = 0; break;
         }
 
@@ -460,71 +473,40 @@ static void test4(void)
 /* ═══════════════════════════════════════════════════════════════════════════
  * Test 5: TIR — TX-frame complete interrupt
  *
- * Because advance() is lazy (called only from b_transport), it may
- * process many baud ticks in one call.  When Tests 1-4 have run before
- * this point, a long gap exists between the last advance() and this
- * TBUF write; advance() processes all those ticks at once, completing
- * the TX frame and firing both TBIR and TIR in a single b_transport.
- * The ISR therefore logs {TBIR} and {TIR} in the same call.
- *
- * When running standalone (no prior tests), advance() starts fresh so
- * the timing gap from reset to the TBUF write determines whether TBIR
- * and TIR fire together or in separate b_transport calls.
- *
- * If TIR is not already in the log after waiting for TBIR (which can
- * happen if the elapsed time spans exactly one frame), the firmware
- * reads UA_CON periodically to drive advance() forward until TIR fires
- * and the edge-triggered GIC delivers a second IRQ.
+ * TIR is now delivered automatically via tir_auto_method (SC_METHOD on
+ * m_sig_tir.pos()) at T+frame_duration, in the same delta epoch as RIR_B.
+ * No UA_CON polling loop needed — just wait for 3 events: TBIR_A, TIR_A,
+ * RIR_B.  This test exercises the same path as Tests 1-4 but is kept
+ * separate to explicitly verify TIR standalone.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void test5(void)
 {
-    unsigned int base, i;
-    int          tir_idx;
+    unsigned int base;
 
-    put_str("Test 5: TIR — TX-frame complete (ISR)\r\n");
+    put_str("Test 5: TIR — TX-frame complete (ISR, auto-delivered)\r\n");
     base = test_begin();
     UA_TBUF = 0x5Au;
 
-    /* Wait for at least TBIR_A */
-    if (!wait_n(base + 1u)) {
-        fail_test("T5-TBIR_A", "timeout"); return;
+    /* Wait for TBIR_A + TIR_A + RIR_B (3 events). */
+    if (!wait_n(base + 3u)) {
+        fail_test("T5", "IRQ timeout"); return;
     }
     if (find_event(base, IRQ_USART_A, STATUS_TBIR) < 0) {
         fail_test("T5-TBIR_A", "not in ISR log"); return;
     }
     put_str("  [ISR] TBIR_A confirmed\r\n");
 
-    /* Check if TIR was already logged in the same (or a subsequent) ISR. */
-    tir_idx = find_event(base, IRQ_USART_A, STATUS_TIR);
-
-    if (tir_idx < 0) {
-        /* TIR not yet seen.  Drive advance() by reading UA_CON (any
-         * non-STATUS access goes through m_bus_fwd → advance()).
-         * TBIR de-asserts after 2 clock periods (~20 ns at 100 MHz),
-         * then TIR fires after the full baud frame (~3.2 µs at 100 MHz
-         * with BG=0 prescaler/2, 8N1).  The falling edge of irq_a after
-         * TBIR de-asserts, followed by the rising edge when TIR fires,
-         * gives the GIC a second edge trigger for IRQ 32.              */
-        for (i = 0u; i < 500u; ++i) {
-            volatile unsigned int dummy = UA_CON;  /* triggers advance() */
-            (void)dummy;
-            tir_idx = find_event(base, IRQ_USART_A, STATUS_TIR);
-            if (tir_idx >= 0) break;
-            /* A handful of NOPs advances simulation time a little between
-             * each advance() call, helping separate TBIR de-assertion
-             * from TIR assertion into distinct b_transport calls.       */
-            __asm__ volatile("nop\nnop\nnop\nnop\nnop" ::: "memory");
-        }
+    if (find_event(base, IRQ_USART_A, STATUS_TIR) < 0) {
+        fail_test("T5-TIR_A", "not in ISR log"); return;
     }
+    put_str("  [ISR] TIR_A  confirmed\r\n");
 
-    if (tir_idx >= 0) {
-        put_str("  [ISR] TIR_A  confirmed\r\n");
-        pass_test("Test5 TIR TX-complete");
-    } else {
-        put_str("  TIR not seen in ISR log after 500 advance() calls\r\n");
-        put_str("  STATUS_A="); put_hex(UA_STATUS); put_str("\r\n");
-        fail_test("Test5 TIR", "TIR never arrived");
+    if (find_event(base, IRQ_USART_B, STATUS_RIR) < 0) {
+        fail_test("T5-RIR_B", "not in ISR log"); return;
     }
+    put_str("  [ISR] RIR_B  confirmed\r\n");
+
+    pass_test("Test5 TIR TX-complete");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

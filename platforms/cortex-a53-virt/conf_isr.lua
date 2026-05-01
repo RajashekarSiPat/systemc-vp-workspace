@@ -53,7 +53,7 @@ end
 
 platform = {
     moduletype = "Container",
-    quantum_ns = 1000000,
+    quantum_ns = 10000,
 
     router = { moduletype = "router", log_level = 0 },
 
