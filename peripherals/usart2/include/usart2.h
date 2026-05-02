@@ -65,6 +65,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -407,6 +408,11 @@ private:
             ++m_tbuf_write_count;
             is_tbuf_write = true;
 
+            if (irq.size() > 0u) {
+                std::lock_guard<std::mutex> lk(m_tbir_sync_mtx);
+                m_tbir_irq_pending = true;
+            }
+
             if (m_tf) {
                 std::lock_guard<std::mutex> lk(m_txd_mtx);
                 m_txd_queue.push(byte);
@@ -426,16 +432,22 @@ private:
          * Test5's UA_CON polling loop triggers this path to observe TIR.  */
         update_status_from_core();
 
-        /* After a TBUF write, sleep the QEMU thread so the SC scheduler gets
-         * guaranteed wall-clock time to complete the full biflow-enqueue →
-         * usart2_b.rx_receive → RIR_B → irq_pulse chain before the firmware
-         * enters WFI.  A single yield() is not enough: yield only donates one
-         * OS scheduling slice, but the async_event + multiple SC delta cycles
-         * can easily span several slices.  500 µs is orders of magnitude longer
-         * than the SC thread needs (~tens of µs) while adding negligible
-         * simulation overhead (USART frame_duration is already ~3.2 µs).    */
-        if (is_tbuf_write)
-            std::this_thread::sleep_for(std::chrono::microseconds(2000));
+        /* After a TBUF write, wait for the SC scheduler to drive the TBIR GIC
+         * edge (irq_method → irq_pulse_method → irq->write(true)).
+         * irq_pulse_method clears m_tbir_irq_pending and signals m_tbir_sync_cv.
+         *
+         * A plain wait() would deadlock: the SC thread needs the QEMU iothread
+         * lock to call gpio_set(), but the main-loop thread (which holds the
+         * lock) waits for the vCPU to advance time — and the vCPU is blocked
+         * here.  wait_for() breaks the cycle: if the SC thread delivers TBIR
+         * before the timeout the condvar fires and we return immediately;
+         * otherwise we time out and let the firmware's WFI catch the pending
+         * GIC edge when the vCPU resumes and re-enters QEMU execution.        */
+        if (is_tbuf_write && irq.size() > 0u) {
+            std::unique_lock<std::mutex> lk(m_tbir_sync_mtx);
+            m_tbir_sync_cv.wait_for(lk, std::chrono::milliseconds(5),
+                                    [this]{ return !m_tbir_irq_pending; });
+        }
     }
 
     /* ── rx_receive ──────────────────────────────────────────────────────────
@@ -495,13 +507,22 @@ private:
     }
 
     /* ── irq_pulse_method ───────────────────────────────────────────────── */
-    /* Step 2: drive HIGH, producing the guaranteed rising edge for the GIC. */
+    /* Step 2: drive HIGH, producing the guaranteed rising edge for the GIC.
+     * Also unblocks any QEMU thread waiting in b_transport for TBIR delivery. */
     void irq_pulse_method()
     {
         if (irq.size() > 0)
             irq->write(true);           /* LOW→HIGH edge (delta D+1)        */
         m_sig_irq_out.write(true);
         m_irq_state = true;
+
+        {
+            std::lock_guard<std::mutex> lk(m_tbir_sync_mtx);
+            if (m_tbir_irq_pending) {
+                m_tbir_irq_pending = false;
+                m_tbir_sync_cv.notify_one();
+            }
+        }
 
         if (m_tf) {
             uint32_t mask = m_pending_trace_irqs.exchange(0u,
@@ -610,6 +631,11 @@ private:
     sc_core::sc_event m_rir_expire_ev;
     sc_core::sc_event m_eir_expire_ev;
     sc_core::sc_event m_irq_expire_ev;
+
+    /* ── TBIR GIC-delivery synchronization (QEMU thread ↔ SC thread) ───── */
+    std::mutex              m_tbir_sync_mtx;
+    std::condition_variable m_tbir_sync_cv;
+    bool                    m_tbir_irq_pending{false};
 
     /* ── TX frame-level state ───────────────────────────────────────────── */
     gs::async_event          m_txd_start_ev; ///< async: wakes SC from QEMU thread
