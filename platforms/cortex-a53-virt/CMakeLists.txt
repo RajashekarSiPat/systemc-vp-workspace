@@ -87,6 +87,23 @@ if(AARCH64_GCC)
     )
     add_custom_target(cortex-a53-virt-fw-isr ALL DEPENDS ${FW4_ELF})
 
+    # ---- hello_i2c_isr.elf — I2C interrupt stress test -------------------------
+    set(FW5_SRC "${CMAKE_SOURCE_DIR}/baremetal/cortex-a53/src/hello_i2c_isr.c")
+    set(FW5_ELF "${CMAKE_CURRENT_SOURCE_DIR}/hello_i2c_isr.elf")
+
+    add_custom_command(
+        OUTPUT  ${FW5_ELF}
+        COMMAND ${AARCH64_GCC}
+            -nostdlib -static
+            -Ttext=0x80000000 -e _start
+            -Wl,--build-id=none -Wl,-n
+            -o ${FW5_ELF}
+            ${FW5_SRC}
+        DEPENDS ${FW5_SRC}
+        COMMENT "Cross-compiling hello_i2c_isr.elf for AArch64"
+    )
+    add_custom_target(cortex-a53-virt-fw-i2c-isr ALL DEPENDS ${FW5_ELF})
+
 else()
     message(WARNING
         "aarch64-linux-gnu-gcc not found. "
