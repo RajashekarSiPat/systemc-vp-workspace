@@ -19,36 +19,30 @@
  *   0x10  DR     data register
  *   0x14  SR1    SB(0),ADDR(1),BTF(2),STOPF(4),RxNE(6),TxE(7),AF(10),...
  *   0x18  SR2    MSL(0),BUSY(1),TRA(2) — reading clears ADDR in SR1
- *   0x1C  CCR    clock control (stored, not used for timing in TLM model)
- *   0x20  TRISE  rise time (stored, not used)
+ *   0x1C  CCR    clock control (used to derive frame-level byte time)
+ *   0x20  TRISE  rise time (stored)
  *
- * ── Synchronisation mechanism ─────────────────────────────────────────────────
+ * ── IRQ and transfer timing ───────────────────────────────────────────────────
  *
- *   Uses a generation counter (m_irq_gen) instead of a bool flag.
- *   wait_for_irq_delivery() captures m_irq_gen before the write, then
- *   waits for it to change (any irq_pulse_method increments it).
- *
- *   Compared to the bool approach: no "stolen-wake" race — rapid-fire
- *   interrupts each get their own generation increment, so every caller
- *   of wait_for_irq_delivery() waits for exactly its own delivery.
- *
- *   m_irq_sync_timeouts counts timeout-path occurrences for diagnostics.
+ *   Events are delivered asynchronously to the GIC using two-delta pulses.
+ *   Immediate register events are delayed by 1 ns of simulated time so the
+ *   QEMU MMIO path can return before the interrupt is observed.  Data transfer
+ *   events use one scheduled SystemC event per I2C byte frame.
  *
  * ── State machine ─────────────────────────────────────────────────────────────
  *
- *   IDLE → START(SB) → ADDR_ACK(ADDR)/AF(ER) → TX_DATA(TxE per byte)
- *                                             → RX_DATA(RxNE per byte)
+ *   IDLE → START(SB) → ADDR_ACK(ADDR)/AF(ER) → TX_DATA(TxE+BTF per byte)
+ *                                             → RX_DATA(RxNE/OVR per byte)
+ *
+ *   Transfer timing is frame-level: one SystemC event per I2C byte frame
+ *   (8 data bits + ACK/NACK).  The model does not sample bits or toggle
+ *   SCL/SDA.
  */
 
 #pragma once
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
-#include <mutex>
-#include <thread>
 #include <systemc>
 #include "tlm.h"
 #include "tlm_utils/simple_target_socket.h"
@@ -78,12 +72,12 @@ public:
         , m_slave_addr("slave_addr", 0x50u, "Virtual slave 7-bit address")
         , m_nack_addr ("nack_addr",  0xFFu, "Force NACK on this address (0xFF = disabled)")
         , m_cr1(0u), m_cr2(0u), m_oar1(0u), m_oar2(0u)
-        , m_dr_rx(0u), m_sr1(0u), m_sr2(0u), m_ccr(0u), m_trise(0u)
+        , m_dr_tx(0u), m_dr_rx(0u), m_sr1(0u), m_sr2(0u), m_ccr(0u), m_trise(0u)
         , m_state(State::IDLE)
         , m_rx_mode(false)
+        , m_rx_frame_pending(false)
+        , m_tx_frame_pending(false)
         , m_slave_ptr(0u)
-        , m_irq_gen(0u)
-        , m_irq_sync_timeouts(0u)
     {
         for (int i = 0; i < 256; ++i)
             m_slave_mem[i] = static_cast<uint8_t>(0xA0u + static_cast<uint8_t>(i));
@@ -94,19 +88,38 @@ public:
         SC_METHOD(ev_pulse_method);sensitive << m_ev_pulse_event;  dont_initialize();
         SC_METHOD(er_irq_method);  sensitive << m_er_event;       dont_initialize();
         SC_METHOD(er_pulse_method);sensitive << m_er_pulse_event;  dont_initialize();
+        SC_METHOD(rx_arm_method); sensitive << m_rx_arm_event; dont_initialize();
+        SC_METHOD(rx_frame_done_method); sensitive << m_rx_frame_done_event; dont_initialize();
+        SC_METHOD(tx_frame_done_method); sensitive << m_tx_frame_done_event; dont_initialize();
     }
 
 private:
     /* ── Register bit constants ─────────────────────────────────────────────── */
     static constexpr uint32_t CR1_PE    = (1u << 0);
+    static constexpr uint32_t CR1_SMBUS = (1u << 1);
+    static constexpr uint32_t CR1_ENPEC = (1u << 5);
+    static constexpr uint32_t CR1_ENGC  = (1u << 6);
+    static constexpr uint32_t CR1_NOSTRETCH = (1u << 7);
     static constexpr uint32_t CR1_START = (1u << 8);
     static constexpr uint32_t CR1_STOP  = (1u << 9);
     static constexpr uint32_t CR1_ACK   = (1u << 10);
+    static constexpr uint32_t CR1_POS   = (1u << 11);
+    static constexpr uint32_t CR1_PEC   = (1u << 12);
+    static constexpr uint32_t CR1_ALERT = (1u << 13);
     static constexpr uint32_t CR1_SWRST = (1u << 15);
+    static constexpr uint32_t CR1_RW_MASK =
+        CR1_PE | CR1_SMBUS | CR1_ENPEC | CR1_ENGC | CR1_NOSTRETCH |
+        CR1_ACK | CR1_POS | CR1_PEC | CR1_ALERT;
 
+    static constexpr uint32_t CR2_FREQ_MASK = 0x3Fu;
     static constexpr uint32_t CR2_ITERREN = (1u << 8);
     static constexpr uint32_t CR2_ITEVTEN = (1u << 9);
     static constexpr uint32_t CR2_ITBUFEN = (1u << 10);
+    static constexpr uint32_t CR2_DMAEN   = (1u << 11);
+    static constexpr uint32_t CR2_LAST    = (1u << 12);
+    static constexpr uint32_t CR2_RW_MASK =
+        CR2_FREQ_MASK | CR2_ITERREN | CR2_ITEVTEN | CR2_ITBUFEN |
+        CR2_DMAEN | CR2_LAST;
 
     static constexpr uint32_t SR1_SB    = (1u << 0);
     static constexpr uint32_t SR1_ADDR  = (1u << 1);
@@ -114,15 +127,30 @@ private:
     static constexpr uint32_t SR1_STOPF = (1u << 4);
     static constexpr uint32_t SR1_RxNE  = (1u << 6);
     static constexpr uint32_t SR1_TxE   = (1u << 7);
+    static constexpr uint32_t SR1_BERR  = (1u << 8);
+    static constexpr uint32_t SR1_ARLO  = (1u << 9);
     static constexpr uint32_t SR1_AF    = (1u << 10);
+    static constexpr uint32_t SR1_OVR   = (1u << 11);
+    static constexpr uint32_t SR1_PECERR = (1u << 12);
+    static constexpr uint32_t SR1_TIMEOUT = (1u << 14);
+    static constexpr uint32_t SR1_SMBALERT = (1u << 15);
 
     /* Error bits cleared on SR1 read or by writing 0 */
     static constexpr uint32_t SR1_ERR_MASK =
-        (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12);
+        SR1_BERR | SR1_ARLO | SR1_AF | SR1_OVR | SR1_PECERR |
+        SR1_TIMEOUT | SR1_SMBALERT;
+
+    static constexpr uint32_t SR1_RO_MASK =
+        SR1_SB | SR1_ADDR | SR1_BTF | SR1_STOPF | SR1_RxNE | SR1_TxE |
+        SR1_ERR_MASK;
 
     static constexpr uint32_t SR2_MSL  = (1u << 0);
     static constexpr uint32_t SR2_BUSY = (1u << 1);
     static constexpr uint32_t SR2_TRA  = (1u << 2);
+    static constexpr uint32_t SR2_GENCALL = (1u << 4);
+    static constexpr uint32_t SR2_SMBDEFAULT = (1u << 5);
+    static constexpr uint32_t SR2_SMBHOST = (1u << 6);
+    static constexpr uint32_t SR2_DUALF = (1u << 7);
 
     /* Register offsets */
     static constexpr uint64_t OFF_CR1   = 0x00u;
@@ -144,20 +172,17 @@ private:
 
     /* ── Registers ──────────────────────────────────────────────────────────── */
     uint32_t m_cr1, m_cr2, m_oar1, m_oar2;
+    uint32_t m_dr_tx;  /* TX holding register */
     uint32_t m_dr_rx;  /* RX holding register */
     uint32_t m_sr1, m_sr2, m_ccr, m_trise;
 
     /* ── State ──────────────────────────────────────────────────────────────── */
     State   m_state;
     bool    m_rx_mode;
+    bool    m_rx_frame_pending;
+    bool    m_tx_frame_pending;
     uint8_t m_slave_ptr;
     uint8_t m_slave_mem[256];
-
-    /* ── Generation-counter sync ────────────────────────────────────────────── */
-    std::mutex              m_irq_sync_mtx;
-    std::condition_variable m_irq_sync_cv;
-    uint32_t                m_irq_gen;
-    std::atomic<uint32_t>   m_irq_sync_timeouts;
 
     /* ── Async events (wakes SC from vCPU thread) ───────────────────────────── */
     gs::async_event m_ev_event{true};
@@ -166,46 +191,107 @@ private:
     /* ── Two-delta pulse events (SC scheduler only) ─────────────────────────── */
     sc_core::sc_event m_ev_pulse_event;
     sc_core::sc_event m_er_pulse_event;
+    sc_core::sc_event m_rx_arm_event;
+    sc_core::sc_event m_rx_frame_done_event;
+    sc_core::sc_event m_tx_frame_done_event;
 
     /* ── Helpers ────────────────────────────────────────────────────────────── */
 
     void do_reset()
     {
         m_cr1 = m_cr2 = m_oar1 = m_oar2 = 0u;
-        m_dr_rx = m_sr1 = m_sr2 = 0u;
+        m_dr_tx = m_dr_rx = m_sr1 = m_sr2 = 0u;
+        m_ccr = m_trise = 0u;
         m_state = State::IDLE;
         m_rx_mode = false;
+        m_rx_frame_pending = false;
+        m_tx_frame_pending = false;
         m_slave_ptr = 0u;
+        m_rx_arm_event.cancel();
+        m_rx_frame_done_event.cancel();
+        m_tx_frame_done_event.cancel();
         SCP_INFO(()) << "I2cStm32: reset";
     }
 
-    /* Call after scheduling an EV or ER event to ensure the GIC edge is
-     * delivered before b_transport returns.  Uses a generation counter so
-     * rapid-fire interrupts never wake the wrong waiter.                   */
-    void wait_for_irq_delivery()
+    sc_core::sc_time byte_frame_time() const
     {
-        if (ev_irq.size() == 0u && er_irq.size() == 0u) return;
-        std::unique_lock<std::mutex> lk(m_irq_sync_mtx);
-        const uint32_t before = m_irq_gen;
-        const bool fired = m_irq_sync_cv.wait_for(
-            lk, std::chrono::milliseconds(5),
-            [this, before]{ return m_irq_gen != before; });
-        if (!fired) {
-            ++m_irq_sync_timeouts;
-            SCP_WARN(()) << "I2cStm32: IRQ delivery timeout #"
-                         << m_irq_sync_timeouts.load();
+        uint32_t freq_mhz = m_cr2 & CR2_FREQ_MASK;
+        if (freq_mhz < 2u) freq_mhz = 2u;
+
+        uint32_t ccr = m_ccr & 0x0FFFu;
+        if (ccr == 0u) ccr = 1u;
+
+        const bool fast = (m_ccr & (1u << 15)) != 0u;
+        const bool duty16_9 = (m_ccr & (1u << 14)) != 0u;
+        uint64_t scl_period_ns;
+        if (fast) {
+            const uint64_t mul = duty16_9 ? 25u : 3u;
+            scl_period_ns = (mul * static_cast<uint64_t>(ccr) * 1000u) / freq_mhz;
+        } else {
+            scl_period_ns = (2u * static_cast<uint64_t>(ccr) * 1000u) / freq_mhz;
+        }
+        if (scl_period_ns == 0u) scl_period_ns = 1u;
+        return sc_core::sc_time(9u * scl_period_ns, sc_core::SC_NS);
+    }
+
+    bool ev_irq_enabled(uint32_t bits) const
+    {
+        if ((m_cr2 & CR2_ITEVTEN) == 0u) return false;
+        const uint32_t buf_bits = SR1_TxE | SR1_RxNE;
+        if ((bits & buf_bits) && (m_cr2 & CR2_ITBUFEN) == 0u)
+            bits &= ~buf_bits;
+        return bits != 0u;
+    }
+
+    bool er_irq_enabled(uint32_t bits) const
+    {
+        return bits != 0u && (m_cr2 & CR2_ITERREN) != 0u;
+    }
+
+    void set_ev_flags(uint32_t bits, bool sync_delivery)
+    {
+        (void)sync_delivery;
+        m_sr1 |= bits;
+        if (ev_irq_enabled(bits)) {
+            m_ev_event.notify(sc_core::sc_time(1, sc_core::SC_NS));
         }
     }
 
-    void notify_ev_after_mmio_return()
+    void set_er_flags(uint32_t bits, bool sync_delivery)
     {
-        /* Read-side RxNE IRQs must not wake QEMU until QBOX has committed the
-         * MMIO load result back into the guest register.  Notify from a host
-         * thread so async_event posts the SC event after b_transport returns. */
-        std::thread([this] {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-            m_ev_event.notify(sc_core::SC_ZERO_TIME);
-        }).detach();
+        (void)sync_delivery;
+        m_sr1 |= bits;
+        if (er_irq_enabled(bits)) {
+            m_er_event.notify(sc_core::sc_time(1, sc_core::SC_NS));
+        }
+    }
+
+    void clear_bus()
+    {
+        m_sr1 &= ~(SR1_SB | SR1_ADDR | SR1_BTF | SR1_RxNE | SR1_TxE);
+        m_sr2 &= ~(SR2_MSL | SR2_BUSY | SR2_TRA);
+        m_state = State::IDLE;
+        m_rx_mode = false;
+        m_rx_frame_pending = false;
+        m_tx_frame_pending = false;
+        m_rx_arm_event.cancel();
+        m_rx_frame_done_event.cancel();
+        m_tx_frame_done_event.cancel();
+    }
+
+    void schedule_rx_frame()
+    {
+        if (m_state != State::RX_DATA || m_rx_frame_pending) return;
+        if ((m_cr1 & (CR1_PE | CR1_ACK)) != (CR1_PE | CR1_ACK)) return;
+        m_rx_frame_pending = true;
+        m_rx_frame_done_event.notify(byte_frame_time());
+    }
+
+    void schedule_tx_frame()
+    {
+        if (m_state != State::TX_DATA || m_tx_frame_pending) return;
+        m_tx_frame_pending = true;
+        m_tx_frame_done_event.notify(byte_frame_time());
     }
 
     /* ── b_transport ────────────────────────────────────────────────────────── */
@@ -225,12 +311,18 @@ private:
             case OFF_CR2:   val = m_cr2;  break;
             case OFF_OAR1:  val = m_oar1; break;
             case OFF_OAR2:  val = m_oar2; break;
+            case OFF_DR: {
+                val = m_dr_rx & 0xFFu;
+                m_sr1 &= ~(SR1_RxNE | SR1_BTF);
+                if (m_rx_mode && m_state == State::RX_DATA)
+                    m_rx_arm_event.notify(sc_core::SC_ZERO_TIME);
+                break;
+            }
             case OFF_CCR:   val = m_ccr;  break;
             case OFF_TRISE: val = m_trise; break;
 
             case OFF_SR1:
                 val = m_sr1;
-                m_sr1 &= ~SR1_ERR_MASK;   /* error bits cleared on read */
                 break;
 
             case OFF_SR2:
@@ -238,29 +330,9 @@ private:
                 /* Second step of ADDR-clear sequence: reading SR2 clears ADDR */
                 if (m_sr1 & SR1_ADDR) {
                     m_sr1 &= ~SR1_ADDR;
-                    if (m_rx_mode && m_state == State::RX_DATA) {
-                        /* Load first RxNE byte and fire the interrupt.
-                         * Do NOT call wait_for_irq_delivery() here — for reads,
-                         * QBOX delivers the MMIO result after b_transport returns.
-                         * Calling wait_for_irq_delivery() inside a read b_transport
-                         * causes cpu_interrupt() to wake the QEMU thread before
-                         * QBOX commits the TLM buffer, corrupting the load result.
-                         * The firmware's i2c_wait_n + WFI loop handles the async
-                         * interrupt delivery correctly.                           */
-                        m_dr_rx = m_slave_mem[m_slave_ptr % 256u];
-                        ++m_slave_ptr;
-                        m_sr1  |= SR1_RxNE;
-                        notify_ev_after_mmio_return();
-                    }
+                    if (m_rx_mode && m_state == State::RX_DATA)
+                        m_rx_arm_event.notify(sc_core::SC_ZERO_TIME);
                 }
-                break;
-
-            case OFF_DR:
-                val     = m_dr_rx & 0xFFu;
-                m_sr1  &= ~SR1_RxNE;
-                m_dr_rx = m_slave_mem[m_slave_ptr++ % 256u];
-                m_sr1  |= SR1_RxNE;
-                notify_ev_after_mmio_return();
                 break;
 
             default:
@@ -275,11 +347,11 @@ private:
 
             switch (off) {
             case OFF_CR1:   handle_cr1_write(wval);   break;
-            case OFF_CR2:   m_cr2 = wval & 0x3FFFu;  break;
-            case OFF_OAR1:  m_oar1 = wval;            break;
-            case OFF_OAR2:  m_oar2 = wval;            break;
-            case OFF_CCR:   m_ccr  = wval;            break;
-            case OFF_TRISE: m_trise = wval;           break;
+            case OFF_CR2:   m_cr2 = wval & CR2_RW_MASK; break;
+            case OFF_OAR1:  m_oar1 = wval & 0x03FFu;    break;
+            case OFF_OAR2:  m_oar2 = wval & 0x00FFu;    break;
+            case OFF_CCR:   m_ccr  = wval & 0xCFFFu;    break;
+            case OFF_TRISE: m_trise = wval & 0x3Fu;      break;
             case OFF_DR:    handle_dr_write(wval);    break;
             case OFF_SR1:
                 /* Write-0-to-clear for error bits */
@@ -299,22 +371,20 @@ private:
         if ((m_cr1 & CR1_PE) && !(val & CR1_PE)) { do_reset(); return; }
 
         /* Latch CR1 without the self-clearing bits */
-        m_cr1 = val & ~(CR1_START | CR1_STOP);
+        m_cr1 = val & CR1_RW_MASK;
 
         if (val & CR1_STOP) {
-            m_sr1   = 0u;
-            m_sr2   = 0u;
-            m_state = State::IDLE;
+            clear_bus();
             return;  /* no interrupt on master STOP */
         }
 
         if ((val & CR1_START) && (val & CR1_PE)) {
             m_slave_ptr = 0u;  /* reset slave pointer for each new transaction */
-            m_sr1   = SR1_SB;
+            m_sr1  &= ~(SR1_ADDR | SR1_BTF | SR1_RxNE | SR1_TxE);
             m_sr2   = SR2_MSL | SR2_BUSY;
             m_state = State::STARTED;
-            m_ev_event.notify(sc_core::SC_ZERO_TIME);
-            wait_for_irq_delivery();
+            m_rx_mode = false;
+            set_ev_flags(SR1_SB, true);
         }
     }
 
@@ -331,26 +401,52 @@ private:
             const uint32_t nack  = m_nack_addr.get_value()  & 0x7Fu;
 
             if (addr == slave && addr != nack) {
-                m_sr1   = SR1_ADDR;
+                m_sr1   = (m_sr1 & ~(SR1_SB | SR1_TxE | SR1_RxNE | SR1_BTF)) | SR1_ADDR;
                 m_sr2   = SR2_MSL | SR2_BUSY | (m_rx_mode ? 0u : SR2_TRA);
                 m_state = m_rx_mode ? State::RX_DATA : State::TX_DATA;
-                m_ev_event.notify(sc_core::SC_ZERO_TIME);
-                wait_for_irq_delivery();
+                set_ev_flags(SR1_ADDR, true);
             } else {
-                m_sr1   = SR1_AF;
+                m_sr1   = (m_sr1 & ~SR1_SB) | SR1_AF;
                 m_state = State::IDLE;
-                m_er_event.notify(sc_core::SC_ZERO_TIME);
-                wait_for_irq_delivery();
+                m_sr2  &= ~(SR2_MSL | SR2_BUSY | SR2_TRA);
+                set_er_flags(SR1_AF, true);
             }
 
         } else if (m_state == State::TX_DATA) {
-            /* TLM slave absorbs the byte; read memory stays immutable */
-            m_sr1 = (m_sr1 & ~SR1_TxE) | SR1_TxE;
-            m_ev_event.notify(sc_core::SC_ZERO_TIME);
-            wait_for_irq_delivery();
+            m_dr_tx = byte;
+            m_sr1 &= ~(SR1_TxE | SR1_BTF);
+            schedule_tx_frame();
         } else {
             SCP_WARN(()) << "I2cStm32: DR write in unexpected state";
         }
+    }
+
+    void rx_arm_method()
+    {
+        schedule_rx_frame();
+    }
+
+    void rx_frame_done_method()
+    {
+        m_rx_frame_pending = false;
+        if (m_state != State::RX_DATA || (m_cr1 & CR1_PE) == 0u) return;
+
+        if (m_sr1 & SR1_RxNE) {
+            set_er_flags(SR1_OVR, false);
+            return;
+        }
+
+        m_dr_rx = m_slave_mem[m_slave_ptr++ % 256u];
+        set_ev_flags(SR1_RxNE, false);
+    }
+
+    void tx_frame_done_method()
+    {
+        m_tx_frame_pending = false;
+        if (m_state != State::TX_DATA || (m_cr1 & CR1_PE) == 0u) return;
+
+        (void)m_dr_tx;
+        set_ev_flags(SR1_TxE | SR1_BTF, false);
     }
 
     /* ── SC-thread IRQ delivery (two-delta pulse) ───────────────────────────── */
@@ -364,9 +460,6 @@ private:
     void ev_pulse_method()
     {
         if (ev_irq.size() > 0u) ev_irq->write(true);
-        std::lock_guard<std::mutex> lk(m_irq_sync_mtx);
-        ++m_irq_gen;
-        m_irq_sync_cv.notify_all();
     }
 
     void er_irq_method()
@@ -378,9 +471,6 @@ private:
     void er_pulse_method()
     {
         if (er_irq.size() > 0u) er_irq->write(true);
-        std::lock_guard<std::mutex> lk(m_irq_sync_mtx);
-        ++m_irq_gen;
-        m_irq_sync_cv.notify_all();
     }
 };
 

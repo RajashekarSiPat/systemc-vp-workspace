@@ -18,10 +18,14 @@
  *   4. Bad address : SB+AF                  = 1 EV + 1 ER interrupt
  *   5. TX 32 bytes : SB+ADDR+32xTxE         = 34 EV interrupts (stress test)
  *   6. Repeat start: TX2+RX2 without STOP   = (SB+ADDR+2xTxE)+(SB+ADDR+2xRxNE) = 8 EV interrupts
+ *   7. BTF on TX completion
+ *   8. ITBUFEN masks TxE/RxNE interrupt delivery but not flags
+ *   9. STOP and SWRST register/state behavior
+ *  10. AF error flag clears by SR1 write-0
  *
  * Total interrupts across all tests: ~63
  *
- * Sync mechanism under test: generation-counter condvar (I2cStm32 peripheral)
+ * Sync mechanism under test: frame-level sc_time scheduling (I2cStm32 peripheral)
  */
 
 /* ── MMIO helpers ─────────────────────────────────────────────────────────── */
@@ -55,7 +59,17 @@
 #define SR1_BTF    (1u << 2)
 #define SR1_RxNE   (1u << 6)
 #define SR1_TxE    (1u << 7)
+#define SR1_BERR   (1u << 8)
+#define SR1_ARLO   (1u << 9)
 #define SR1_AF     (1u << 10)
+#define SR1_OVR    (1u << 11)
+#define SR1_PECERR (1u << 12)
+#define SR1_TIMEOUT (1u << 14)
+#define SR1_SMBALERT (1u << 15)
+
+#define SR2_MSL    (1u << 0)
+#define SR2_BUSY   (1u << 1)
+#define SR2_TRA    (1u << 2)
 
 /* ── Exiter ───────────────────────────────────────────────────────────────── */
 #define EXITER  MMIO32(0x09010000UL)
@@ -89,7 +103,7 @@ typedef struct {
     unsigned int sr1;     /* SR1 snapshot (before ADDR clear) */
 } I2cIrqEvent;
 
-#define LOG_SIZE 128u
+#define LOG_SIZE 192u
 
 static volatile I2cIrqEvent  g_log[LOG_SIZE];
 static volatile unsigned int g_log_count;
@@ -106,6 +120,7 @@ static void setup_vectors(void);
 static void setup_gic(void);
 static void enable_irq(void);
 static int  i2c_wait_n(unsigned int target);
+static int  i2c_wait_sr1(unsigned int mask);
 static int  i2c_find(unsigned int from, unsigned int irq_id, unsigned int sr1_mask);
 static void i2c_init(void);
 static void i2c_recover(void);
@@ -123,6 +138,10 @@ static void test3(void);
 static void test4(void);
 static void test5(void);
 static void test6(void);
+static void test7(void);
+static void test8(void);
+static void test9(void);
+static void test10(void);
 
 void __attribute__((naked)) _start(void);
 void __attribute__((naked)) irq_entry(void);
@@ -300,6 +319,16 @@ static int i2c_wait_n(unsigned int target)
     return (int)(g_log_count >= target);
 }
 
+static int i2c_wait_sr1(unsigned int mask)
+{
+    unsigned int timeout = 20000000u;
+    while (--timeout > 0u) {
+        if ((I2C_SR1 & mask) == mask) return 1;
+        __asm__ volatile("" ::: "memory");
+    }
+    return 0;
+}
+
 /* Find a log entry from index 'from' matching irq_id and sr1_mask */
 static int i2c_find(unsigned int from, unsigned int irq_id, unsigned int sr1_mask)
 {
@@ -315,7 +344,7 @@ static void i2c_init(void)
     I2C_CR1 = CR1_SWRST;       /* software reset */
     I2C_CR1 = 0u;               /* release reset */
     I2C_CR2 = 36u;              /* FREQ = 36 (APB MHz, not used for timing in TLM) */
-    I2C_CCR = 180u;             /* standard mode 100 kHz (not enforced in TLM) */
+    I2C_CCR = 4000u;            /* slow frame-level bus for deterministic ISR tests */
     I2C_TRISE = 37u;
     I2C_CR1 = CR1_PE;           /* enable */
     I2C_CR2 |= CR2_ITEVTEN | CR2_ITBUFEN | CR2_ITERREN;
@@ -361,6 +390,7 @@ static void test1(void)
     if (i2c_find(base, IRQ_I2C_EV, SR1_SB)   < 0) { fail_test("T1", "no SB");   return; }
     if (i2c_find(base, IRQ_I2C_EV, SR1_ADDR) < 0) { fail_test("T1", "no ADDR"); return; }
     if (i2c_find(base, IRQ_I2C_EV, SR1_TxE)  < 0) { fail_test("T1", "no TxE");  return; }
+    if (i2c_find(base, IRQ_I2C_EV, SR1_BTF)  < 0) { fail_test("T1", "no BTF");  return; }
 
     put_str("  SB+ADDR+TxE confirmed\r\n");
     pass_test("Test1 TX-1-byte");
@@ -396,6 +426,10 @@ static void test2(void)
     for (i = 0u; i < 8u; ++i)
         if (i2c_find(base + 2u + i, IRQ_I2C_EV, SR1_TxE) < 0) {
             fail_test("T2", "TxE missing"); return;
+        }
+    for (i = 0u; i < 8u; ++i)
+        if (i2c_find(base + 2u + i, IRQ_I2C_EV, SR1_BTF) < 0) {
+            fail_test("T2", "BTF missing"); return;
         }
 
     put_str("  SB+ADDR+8xTxE confirmed\r\n");
@@ -562,6 +596,92 @@ static void test6(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Test 7: TX byte completion sets both TxE and BTF.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test7(void)
+{
+    unsigned int base = g_log_count;
+    put_str("Test 7: TX completion sets TxE+BTF\r\n");
+
+    I2C_CR1 |= CR1_START;
+    if (!i2c_wait_n(base + 1u)) { fail_test("T7", "SB timeout"); i2c_recover(); return; }
+    I2C_DR = (SLAVE_ADDR << 1u) | 0u;
+    if (!i2c_wait_n(base + 2u)) { fail_test("T7", "ADDR timeout"); i2c_recover(); return; }
+    I2C_DR = 0x5Au;
+    if (!i2c_wait_n(base + 3u)) { fail_test("T7", "TxE/BTF timeout"); i2c_recover(); return; }
+    I2C_CR1 |= CR1_STOP;
+
+    if (i2c_find(base + 2u, IRQ_I2C_EV, SR1_TxE | SR1_BTF) < 0) {
+        fail_test("T7", "missing combined TxE+BTF"); return;
+    }
+    pass_test("Test7 TX-BTF");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 8: ITBUFEN masks buffer interrupts while flags still update.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test8(void)
+{
+    unsigned int base = g_log_count;
+    put_str("Test 8: ITBUFEN masks RxNE interrupt but RxNE flag still sets\r\n");
+
+    I2C_CR2 = 36u | CR2_ITEVTEN | CR2_ITERREN;  /* ITBUFEN intentionally off */
+    I2C_CR1 |= CR1_ACK | CR1_START;
+    if (!i2c_wait_n(base + 1u)) { fail_test("T8", "SB timeout"); i2c_recover(); return; }
+    I2C_DR = (SLAVE_ADDR << 1u) | 1u;
+    if (!i2c_wait_n(base + 2u)) { fail_test("T8", "ADDR timeout"); i2c_recover(); return; }
+    if (!i2c_wait_sr1(SR1_RxNE)) { fail_test("T8", "RxNE flag timeout"); i2c_recover(); return; }
+    if (g_log_count != base + 2u) { fail_test("T8", "RxNE IRQ was not masked"); i2c_recover(); return; }
+    I2C_CR1 |= CR1_STOP;
+    i2c_init();
+    pass_test("Test8 ITBUFEN-mask");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 9: STOP clears bus state; SWRST clears user-visible registers.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test9(void)
+{
+    unsigned int base = g_log_count;
+    unsigned int sr2;
+    put_str("Test 9: STOP/SWRST state behavior\r\n");
+
+    I2C_CR1 |= CR1_START;
+    if (!i2c_wait_n(base + 1u)) { fail_test("T9", "SB timeout"); i2c_recover(); return; }
+    I2C_CR1 |= CR1_STOP;
+    sr2 = I2C_SR2;
+    if (sr2 & (SR2_MSL | SR2_BUSY | SR2_TRA)) { fail_test("T9", "STOP left bus busy"); i2c_recover(); return; }
+    if (I2C_CR1 & (CR1_START | CR1_STOP)) { fail_test("T9", "START/STOP did not self-clear"); i2c_recover(); return; }
+
+    I2C_CR1 = CR1_SWRST;
+    if (I2C_CR1 != 0u || I2C_CR2 != 0u || I2C_SR1 != 0u || I2C_SR2 != 0u) {
+        fail_test("T9", "SWRST did not clear registers"); i2c_recover(); return;
+    }
+    i2c_init();
+    pass_test("Test9 STOP-SWRST");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 10: AF remains visible until software clears it by writing 0 to SR1.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void test10(void)
+{
+    unsigned int base = g_log_count;
+    put_str("Test 10: AF flag clears by SR1 write-0\r\n");
+
+    I2C_CR2 = 36u | CR2_ITEVTEN | CR2_ITBUFEN;  /* ITERREN off: poll AF */
+    I2C_CR1 |= CR1_START;
+    if (!i2c_wait_n(base + 1u)) { fail_test("T10", "SB timeout"); i2c_recover(); return; }
+    I2C_DR = (0x7Eu << 1u) | 0u;
+    if (!i2c_wait_sr1(SR1_AF)) { fail_test("T10", "AF flag timeout"); i2c_recover(); return; }
+    I2C_SR1 = 0u;
+    if (I2C_SR1 & SR1_AF) { fail_test("T10", "AF did not clear"); i2c_recover(); return; }
+    I2C_CR1 |= CR1_STOP;
+    i2c_init();
+    pass_test("Test10 AF-clear");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Character output helpers (write direct to USART TBUF — no IRQ needed)
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void put_char(char c)   { UC_TBUF = (unsigned int)c; }
@@ -598,7 +718,7 @@ static void i2c_main(void)
     put_str("\r\n================================================\r\n");
     put_str("  I2C STM32 ISR Interrupt Stress Test\r\n");
     put_str("  Slave 0x50, EV=IRQ34, ER=IRQ35\r\n");
-    put_str("  Gen-counter condvar sync under test\r\n");
+    put_str("  Frame-level sc_time transfer model under test\r\n");
     put_str("================================================\r\n\r\n");
 
     test1();
@@ -607,6 +727,10 @@ static void i2c_main(void)
     test4();
     test5();
     test6();
+    test7();
+    test8();
+    test9();
+    test10();
 
     put_str("\r\n================================================\r\n");
     put_str("  Passed: "); put_dec((unsigned int)g_pass);
