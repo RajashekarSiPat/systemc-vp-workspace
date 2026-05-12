@@ -259,7 +259,7 @@ private:
     /* ── Internal signals ───────────────────────────────────────────────── */
     sc_core::sc_signal<sc_core::sc_time> m_sig_clk;
     sc_core::sc_signal<bool>             m_sig_rst;
-    sc_core::sc_signal<USART_TxRx_Tlm>  m_sig_txd;
+    sc_core::sc_signal<USART_TxRx_Tlm, sc_core::SC_MANY_WRITERS>  m_sig_txd;
     sc_core::sc_signal<USART_TxRx_Tlm>  m_sig_rxd;
     sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_tbir;
     sc_core::sc_signal<bool, sc_core::SC_MANY_WRITERS> m_sig_tir;
@@ -296,8 +296,6 @@ private:
      * ──────────────────────────────────────────────────────────────────────── */
     void update_status_from_core()
     {
-        if (irq.size() == 0u) return;
-
         bool new_irq = false;
 
         if (m_tbuf_write_count > m_tbir_fired_count) {
@@ -325,7 +323,8 @@ private:
         }
 
         if (new_irq) {
-            m_irq_event.notify(sc_core::SC_ZERO_TIME);
+            if (irq.size() > 0u)
+                m_irq_event.notify(sc_core::SC_ZERO_TIME);
         }
     }
 
@@ -336,14 +335,14 @@ private:
     void tir_auto_method()
     {
         if (!m_sig_tir.read()) return;   /* only act on rising edge */
-        if (irq.size() == 0u) return;
         unsigned int tir_count = m_usart.get_tir_fire_count();
         if (tir_count <= m_tir_fired_count) return;
         m_status |= STATUS_TIR;
         m_tir_fired_count = tir_count;
         m_pending_trace_irqs.fetch_or(STATUS_TIR, std::memory_order_relaxed);
         SCP_INFO(()) << "TIR  fired (auto, tir_fire_count=" << tir_count << ")";
-        m_irq_event.notify(sc_core::SC_ZERO_TIME);
+        if (irq.size() > 0u)
+            m_irq_event.notify(sc_core::SC_ZERO_TIME);
     }
 
     /* ── b_transport ─────────────────────────────────────────────────────── */

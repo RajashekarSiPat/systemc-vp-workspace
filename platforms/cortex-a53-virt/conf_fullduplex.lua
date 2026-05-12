@@ -6,6 +6,7 @@
 --   0x09002000 .. 0x09002FFF  USART2 A  (bridge side A — test TX/RX)
 --   0x09003000 .. 0x09003FFF  USART2 B  (bridge side B — test TX/RX)
 --   0x09004000 .. 0x09004FFF  USART2 C  (console — firmware print output)
+--   0x09010000 .. 0x09010FFF  exiter    (firmware stop)
 --
 -- Bridge topology:
 --   usart2_a.backend_socket  ←→  serial_bridge_0.socket_a
@@ -130,6 +131,18 @@ platform = {
     serial_bridge_0 = {
         moduletype = "SerialBridge",
         dylib_path = "serial_bridge",
+    },
+
+    -- -----------------------------------------------------------------------
+    -- Exiter: firmware writes 0 here to call sc_stop() cleanly.
+    -- -----------------------------------------------------------------------
+    exiter_0 = {
+        moduletype    = "exiter",
+        target_socket = {
+            address = 0x09010000,
+            size    = 0x1000,
+            bind    = "&router.initiator_socket",
+        },
     },
 
     -- -----------------------------------------------------------------------

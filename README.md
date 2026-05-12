@@ -248,7 +248,7 @@ This produces:
 
 ---
 
-## Running the simulations
+## Running the simulations and tests
 
 Set `LD_LIBRARY_PATH` so the VP can find QBOX shared libraries and peripheral `.so` files:
 
@@ -258,6 +258,12 @@ qbox/build/install/lib:\
 qbox/build/install/lib/qbox-2.0:\
 qbox/build/install/lib/libqemu:\
 build"
+```
+
+Build the USART2 peripheral and test firmware after source changes:
+
+```bash
+cmake --build build --target usart2 cortex-a53-virt-fw2 cortex-a53-virt-fw3 cortex-a53-virt-fw4
 ```
 
 ### Simple USART
@@ -274,12 +280,16 @@ build"
     --gs_luafile platforms/cortex-a53-virt/conf_usart2.lua
 ```
 
+Expected result: the firmware prints the USART2 banner and exits with status 0.
+
 ### Full-duplex STATUS polling
 
 ```bash
 ./build/platforms/cortex-a53-virt/cortex-a53-virt-vp \
     --gs_luafile platforms/cortex-a53-virt/conf_fullduplex.lua
 ```
+
+Expected result: all five full-duplex STATUS polling tests pass and the VP exits cleanly.
 
 ### GICv3 interrupt tests
 
@@ -302,15 +312,28 @@ ISR_ELF=/path/to/hello_isr.elf ./build/platforms/cortex-a53-virt/cortex-a53-virt
     --gs_luafile platforms/cortex-a53-virt/conf_isr.lua
 ```
 
-Expected output (tests 1–3):
+Expected output:
 
 ```
 ================================================
-  Test 1 PASSED
-  Test 2 PASSED
-  Test 3 PASSED
+  Passed: 0x00000005   Failed: 0x00000000
   ALL TESTS PASSED
 ================================================
+```
+
+### Run all USART2 tests
+
+Run the three USART2 simulations in sequence:
+
+```bash
+./build/platforms/cortex-a53-virt/cortex-a53-virt-vp \
+    --gs_luafile platforms/cortex-a53-virt/conf_usart2.lua
+
+./build/platforms/cortex-a53-virt/cortex-a53-virt-vp \
+    --gs_luafile platforms/cortex-a53-virt/conf_fullduplex.lua
+
+./build/platforms/cortex-a53-virt/cortex-a53-virt-vp \
+    --gs_luafile platforms/cortex-a53-virt/conf_isr.lua
 ```
 
 ### VCD waveform tracing

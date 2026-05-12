@@ -52,6 +52,9 @@
 /* Console: just write bytes to TBUF — wrapper forwards via backend_socket */
 #define UC_TBUF   MMIO32(0x09004004UL)
 
+/* Exiter peripheral: any write calls sc_stop() in SystemC, ending the VP. */
+#define EXITER    MMIO32(0x09010000UL)
+
 #define CON_INIT  0x8049u   /* Mode1 | REN | OEN | R */
 
 #define STATUS_TBIR  (1u << 0)
@@ -250,7 +253,7 @@ t4:
     put_str(g_fail == 0 ? "  ALL TESTS PASSED\r\n" : "  SOME TESTS FAILED\r\n");
     put_str("================================================\r\n");
 
-    while (1) { /* halt */ }
+    EXITER = 0u;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
