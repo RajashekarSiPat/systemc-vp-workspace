@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <systemc>
 #include "tlm.h"
 #include "tlm_utils/simple_target_socket.h"
@@ -196,6 +197,17 @@ private:
         }
     }
 
+    void notify_ev_after_mmio_return()
+    {
+        /* Read-side RxNE IRQs must not wake QEMU until QBOX has committed the
+         * MMIO load result back into the guest register.  Notify from a host
+         * thread so async_event posts the SC event after b_transport returns. */
+        std::thread([this] {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            m_ev_event.notify(sc_core::SC_ZERO_TIME);
+        }).detach();
+    }
+
     /* ── b_transport ────────────────────────────────────────────────────────── */
     void b_transport(tlm::tlm_generic_payload& trans, sc_core::sc_time& /*delay*/)
     {
@@ -238,7 +250,7 @@ private:
                         m_dr_rx = m_slave_mem[m_slave_ptr % 256u];
                         ++m_slave_ptr;
                         m_sr1  |= SR1_RxNE;
-                        m_ev_event.notify(sc_core::SC_ZERO_TIME);
+                        notify_ev_after_mmio_return();
                     }
                 }
                 break;
@@ -248,13 +260,7 @@ private:
                 m_sr1  &= ~SR1_RxNE;
                 m_dr_rx = m_slave_mem[m_slave_ptr++ % 256u];
                 m_sr1  |= SR1_RxNE;
-                /* Fire RxNE for the next byte only after the VCPU has fully
-                 * returned from the MMIO path and is executing guest code.
-                 * A sub-quantum delay (≤ 1 ns) fires while the VCPU is still
-                 * unwinding the TLM call stack, corrupting the load result.
-                 * Using > 1 quantum (quantum_ns = 10 000 ns) guarantees the
-                 * VCPU is in WFI before the interrupt lands.               */
-                m_ev_event.notify(sc_core::sc_time(10001, sc_core::SC_NS));
+                notify_ev_after_mmio_return();
                 break;
 
             default:
